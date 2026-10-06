@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import argparse
 import math
+import multiprocessing as mp_process
 import os
 import sys
 import threading
@@ -76,14 +77,23 @@ def enable_dpi_awareness() -> None:
 
 
 def screen_height() -> int:
-    """Height of the primary monitor in pixels."""
+    """Height of the primary monitor in pixels (1080 if it cannot be found)."""
     if sys.platform == "win32":
         try:
             import ctypes
             return int(ctypes.windll.user32.GetSystemMetrics(1)) or UI_REFERENCE_HEIGHT
         except (AttributeError, OSError):
             pass
-    return UI_REFERENCE_HEIGHT
+        return UI_REFERENCE_HEIGHT
+    try:  # Linux / macOS: Tk is part of most Python installs (Debian/Ubuntu: python3-tk)
+        import tkinter
+        root = tkinter.Tk()
+        root.withdraw()
+        height = int(root.winfo_screenheight())
+        root.destroy()
+        return height or UI_REFERENCE_HEIGHT
+    except Exception:
+        return UI_REFERENCE_HEIGHT
 
 
 def display_size(window: str, w: int, h: int) -> tuple[int, int]:
@@ -178,10 +188,6 @@ FINGERS = [(INDEX_MCP, INDEX_PIP, INDEX_TIP), (MIDDLE_MCP, MIDDLE_PIP, MIDDLE_TI
 # --------------------------------------------------------------------------
 # Geometry helpers (all operate on a (21, 2) float32 array of pixel points)
 # --------------------------------------------------------------------------
-def hand_points(lm, w: int, h: int) -> np.ndarray:
-    return np.array([(p.x * w, p.y * h) for p in lm], dtype=np.float32)
-
-
 def distance(a: np.ndarray, b: np.ndarray) -> float:
     return float(np.linalg.norm(a - b))
 
@@ -235,14 +241,16 @@ class Hand:
 # Threaded camera
 # --------------------------------------------------------------------------
 class CameraStream:
-    """Grabs frames in a background thread so the main loop never blocks on I/O."""
+    """Grabs frames in a background thread so the main loop never blocks on I/O.
+    Frames are resized to the preview size and mirrored here, off the main thread.
+    Published frames are shared between threads, so treat them as read-only."""
 
-    def __init__(self, cap: cv2.VideoCapture):
+    def __init__(self, cap: cv2.VideoCapture, size: tuple[int, int]):
         self.cap = cap
+        self.size = size
         self.cond = threading.Condition()
         self.frame: Optional[np.ndarray] = None
         self.seq = 0
-        self.last_seq = 0
         self.running = True
         self.thread = threading.Thread(target=self._run, daemon=True)
         self.thread.start()
@@ -250,6 +258,10 @@ class CameraStream:
     def _run(self) -> None:
         while self.running:
             ok, frame = self.cap.read()
+            if ok:
+                if (frame.shape[1], frame.shape[0]) != self.size:
+                    frame = cv2.resize(frame, self.size, interpolation=cv2.INTER_LINEAR)
+                frame = cv2.flip(frame, 1)
             with self.cond:
                 if not ok:
                     self.running = False
@@ -258,18 +270,131 @@ class CameraStream:
                     self.seq += 1
                 self.cond.notify_all()
 
-    def read(self, timeout: float = 1.0) -> Optional[np.ndarray]:
-        """Return the newest unseen frame (older frames are dropped), or None."""
+    def read(self, after: int, timeout: float = 1.0) -> tuple[int, Optional[np.ndarray]]:
+        """Wait for a frame newer than sequence number ``after`` (older frames are
+        dropped). Returns (seq, frame), or (after, None) on timeout / end of stream."""
         with self.cond:
-            self.cond.wait_for(lambda: self.seq != self.last_seq or not self.running, timeout)
-            if self.seq == self.last_seq:
-                return None
-            self.last_seq = self.seq
-            return self.frame
+            self.cond.wait_for(lambda: self.seq != after or not self.running, timeout)
+            if self.seq == after:
+                return after, None
+            return self.seq, self.frame
 
     def stop(self) -> None:
         self.running = False
         self.thread.join(timeout=1.0)
+
+
+def detector_process(conn, model_path: str, use_gpu: bool) -> None:
+    """Child process: runs MediaPipe hand detection. It lives in its own process
+    because MediaPipe needs the GIL to hand work between its threads, and sharing
+    the GIL with the display loop made detection several times slower."""
+    def create(delegate):
+        options = vision.HandLandmarkerOptions(
+            base_options=python.BaseOptions(model_asset_path=model_path, delegate=delegate),
+            running_mode=vision.RunningMode.VIDEO, num_hands=2,
+            min_hand_detection_confidence=0.60, min_hand_presence_confidence=0.60,
+            min_tracking_confidence=0.60,
+        )
+        return vision.HandLandmarker.create_from_options(options)
+
+    try:
+        try:
+            landmarker = create(python.BaseOptions.Delegate.GPU if use_gpu else python.BaseOptions.Delegate.CPU)
+            delegate = "GPU" if use_gpu else "CPU"
+        except Exception as error:
+            if not use_gpu:
+                raise
+            print(f"MediaPipe GPU delegate unavailable ({error}); using CPU delegate")
+            landmarker = create(python.BaseOptions.Delegate.CPU)
+            delegate = "CPU (GPU failed)"
+    except BaseException as error:
+        conn.send(("error", repr(error)))
+        return
+    conn.send(("ready", delegate))
+    with landmarker:
+        while True:
+            message = conn.recv()
+            if message is None:
+                break
+            timestamp_ms, rgb = message
+            result = landmarker.detect_for_video(
+                mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb), timestamp_ms)
+            # Tasks labels assume a mirrored/selfie input, which is exactly what we
+            # supply; keep the user's natural Left/Right labels. Points are 0..1.
+            conn.send(("hands", [
+                (handed[0].category_name, np.array([(q.x, q.y) for q in lm], np.float32))
+                for lm, handed in zip(result.hand_landmarks, result.handedness)
+            ]))
+
+
+class HandTracker:
+    """Feeds the newest camera frame to the detector process from a background
+    thread, so the display loop never waits for detection (the slowest step)."""
+
+    def __init__(self, cam: CameraStream, model_path: str, acceleration: "Acceleration",
+                 det_size: tuple[int, int], w: int, h: int):
+        self.cam, self.acceleration = cam, acceleration
+        self.det_size, self.scale = det_size, np.array([w, h], np.float32)
+        self.lock = threading.Lock()
+        self.hands: dict[str, Hand] = {}
+        self.infer_ms = 0.0
+        self.seq = 0                      # bumps once per finished detection
+        self.error: Optional[BaseException] = None
+        self.conn, child_conn = mp_process.Pipe()
+        use_gpu = acceleration.media_pipe_delegate == python.BaseOptions.Delegate.GPU
+        self.process = mp_process.Process(target=detector_process, daemon=True,
+                                          args=(child_conn, model_path, use_gpu))
+        self.process.start()
+        kind, detail = self.conn.recv()   # wait until the model is loaded
+        if kind == "error":
+            raise RuntimeError(f"Hand detector failed to start: {detail}")
+        print(f"MediaPipe: {detail}")
+        self.running = True
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
+
+    def _run(self) -> None:
+        frame_seq, timestamp_ms = 0, 0
+        try:
+            while self.running and self.cam.running:
+                frame_seq, frame = self.cam.read(frame_seq)
+                if frame is None:
+                    continue
+                t0 = time.perf_counter()
+                rgb = self.acceleration.prepare(frame, self.det_size)
+                timestamp_ms = max(timestamp_ms + 1, int(time.monotonic() * 1000))
+                self.conn.send((timestamp_ms, rgb))
+                _, found = self.conn.recv()
+                hands: dict[str, Hand] = {}
+                for label, norm in found:
+                    pts = norm * self.scale
+                    hands[label] = Hand(label, pts, is_fist(pts))  # fist computed once
+                with self.lock:
+                    self.hands, self.seq = hands, self.seq + 1
+                    self.infer_ms = (time.perf_counter() - t0) * 1000.0
+        except BaseException as error:  # surfaced in the main loop
+            self.error = error
+
+    def latest(self) -> tuple[int, dict[str, Hand], float]:
+        with self.lock:
+            return self.seq, self.hands, self.infer_ms
+
+    def stop(self) -> None:
+        self.running = False
+        self.thread.join(timeout=2.0)
+        try:
+            self.conn.send(None)
+        except OSError:
+            pass
+        self.process.join(timeout=2.0)
+        if self.process.is_alive():
+            self.process.terminate()
+
+    def __enter__(self) -> "HandTracker":
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.stop()
 
 class Acceleration:
     """Select the fastest available OpenCV path without requiring GPU hardware."""
@@ -286,14 +411,13 @@ class Acceleration:
 
     @property
     def media_pipe_delegate(self):
-        """GPU delegate is attempted only when acceleration was requested/available.
+        """MediaPipe's GPU delegate (OpenGL) is tried unless --gpu off; the detector
+        falls back to CPU if it cannot start. It does not depend on OpenCL/CUDA.
 
         The MediaPipe pip wheels for Windows are compiled with GPU disabled
         (MEDIAPIPE_DISABLE_GPU), so the GPU delegate can never start there.
         Skip it instead of failing and falling back every launch."""
-        if sys.platform == "win32":
-            return python.BaseOptions.Delegate.CPU
-        if self.mode == "off" or not (self.cuda or self.opencl):
+        if sys.platform == "win32" or self.mode == "off":
             return python.BaseOptions.Delegate.CPU
         return python.BaseOptions.Delegate.GPU
 
@@ -333,6 +457,8 @@ class PerfStats:
         self.worst = 0.0          # worst frametime in last window, ms
         self.infer = 0.0          # smoothed hand-detection time, ms
         self.paint = 0.0          # smoothed gesture + drawing + compositing time, ms
+        self.window_detections = 0
+        self.detect_fps = 0.0     # finished hand detections per second (own thread)
 
     def tick(self, infer_ms: float, paint_ms: float) -> None:
         now = time.perf_counter()
@@ -346,8 +472,13 @@ class PerfStats:
         elapsed = now - self.window_start
         if elapsed >= 0.5:
             self.fps = self.window_frames / elapsed
+            self.detect_fps = self.window_detections / elapsed
             self.worst = self.window_worst
             self.window_start, self.window_frames, self.window_worst = now, 0, 0.0
+            self.window_detections = 0
+
+    def detection(self) -> None:
+        self.window_detections += 1
 
 
 # --------------------------------------------------------------------------
@@ -767,7 +898,7 @@ def draw_ui(frame: np.ndarray, painter: Painter, layout: Layout, stats: PerfStat
         text_box(frame, [
             (f"FPS: {stats.fps:5.1f}", fps_color),
             (f"Frame: {stats.frametime:5.1f} ms (worst {stats.worst:.0f})", white),
-            (f"Detect: {stats.infer:5.1f} ms", white),
+            (f"Detect: {stats.infer:5.1f} ms ({stats.detect_fps:.0f}/s)", white),
             (f"Paint: {stats.paint:5.1f} ms", white),
         ], px(14), bottom + px(12), layout, layout.font(0.55), px(1))
 
@@ -788,7 +919,8 @@ def main() -> None:
     ap.add_argument("--beta", type=float, default=0.025,
                     help="how quickly smoothing relaxes as you move. Higher = less lag on fast strokes.")
     ap.add_argument("--gpu", choices=("auto", "on", "off"), default="auto",
-                    help="GPU acceleration mode: auto detects CUDA/OpenCL, on requires it, off disables it.")
+                    help="GPU acceleration mode: auto detects CUDA/OpenCL and tries MediaPipe's GPU "
+                         "delegate (not on Windows), on requires CUDA/OpenCL, off disables both.")
     args = ap.parse_args()
     if not os.path.isfile(args.model):
         raise FileNotFoundError(f"Hand model not found: {args.model}")
@@ -800,8 +932,10 @@ def main() -> None:
     if acceleration.opencl:
         backends.append("OpenCL")
     print(f"OpenCV acceleration: {', '.join(backends) if backends else 'CPU'}")
-    if sys.platform == "win32":
-        print("MediaPipe: CPU (the Windows pip build has no GPU delegate)")
+
+    # OpenCV's own thread pool (resize, flip, ...) would otherwise use every core in
+    # bursts and starve the detector process; 2 threads measured fastest overall.
+    cv2.setNumThreads(2)
 
     cap = cv2.VideoCapture(args.camera)
     if not cap.isOpened():
@@ -817,8 +951,8 @@ def main() -> None:
     cam_h, cam_w = first.shape[:2]
     w, h = args.width, args.height
     # If the camera delivers a different size, every frame is resized to the preview size.
-    upscale = (cam_w, cam_h) != (w, h)
-    print(f"Camera: {cam_w}x{cam_h}  Preview: {w}x{h}" + ("  (resized)" if upscale else ""))
+    resized = (cam_w, cam_h) != (w, h)
+    print(f"Camera: {cam_w}x{cam_h}  Preview: {w}x{h}" + ("  (resized)" if resized else ""))
 
     if args.detect_width and args.detect_width < w:
         det_w = args.detect_width
@@ -835,65 +969,28 @@ def main() -> None:
     show_stats = True
     window_title = "Hand Paint - S save | C clear | B background | [ ] size | F stats | Q quit"
     # WINDOW_NORMAL lets the view scale when you resize or maximize it.
-    cv2.namedWindow(window_title, cv2.WINDOW_NORMAL)
+    cv2.namedWindow(window_title, cv2.WINDOW_NORMAL | cv2.WINDOW_GUI_NORMAL)
     initial_w = min(1600, max(960, w))
     cv2.resizeWindow(window_title, initial_w, max(540, round(initial_w * h / w)))
-    options = vision.HandLandmarkerOptions(
-        base_options=python.BaseOptions(
-            model_asset_path=args.model,
-            delegate=acceleration.media_pipe_delegate,
-        ),
-        running_mode=vision.RunningMode.VIDEO, num_hands=2,
-        min_hand_detection_confidence=0.60, min_hand_presence_confidence=0.60,
-        min_tracking_confidence=0.60,
-    )
-    cam = CameraStream(cap)
-    timestamp_ms = 0
+    cam = CameraStream(cap, (w, h))
     # Per-side transition state prevents repeated undo/redo while a hand stays closed.
     action_armed = {"Left": True, "Right": True}
     bg_img = np.full((h, w, 3), BG_COLOR, np.uint8)  # beige page, copied over the frame when the switch is on
     try:
-        try:
-            landmarker_context = vision.HandLandmarker.create_from_options(options)
-        except (RuntimeError, ValueError) as error:
-            if acceleration.media_pipe_delegate != python.BaseOptions.Delegate.GPU:
-                raise
-            print(f"MediaPipe GPU delegate unavailable ({error}); using CPU delegate")
-            options.base_options = python.BaseOptions(
-                model_asset_path=args.model,
-                delegate=python.BaseOptions.Delegate.CPU,
-            )
-            landmarker_context = vision.HandLandmarker.create_from_options(options)
-        with landmarker_context as landmarker:
+        with HandTracker(cam, args.model, acceleration, (det_w, det_h), w, h) as tracker:
+            frame_seq = det_seq = 0
+            hands: dict[str, Hand] = {}
+            over_switch = False
+            ui_point = None
             while True:
-                frame = cam.read()
+                frame_seq, frame = cam.read(frame_seq)
+                if tracker.error is not None:
+                    raise tracker.error
                 if frame is None:
                     if not cam.running:
                         break
                     continue
-                frame = cv2.flip(frame, 1)
-
-                # ---- hand detection (on a downscaled copy) ----
-                # Detection reads the camera frame before any upscaling, so the
-                # tracking input stays the same size whatever the preview size is.
-                # Landmarks are normalized (0..1), so they map onto the preview directly.
-                t0 = time.perf_counter()
-                rgb = acceleration.prepare(frame, (det_w, det_h))
-                if upscale:
-                    frame = cv2.resize(frame, (w, h), interpolation=cv2.INTER_LINEAR)
-                image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
-                timestamp_ms = max(timestamp_ms + 1, int(time.monotonic() * 1000))
-                result = landmarker.detect_for_video(image, timestamp_ms)
                 t1 = time.perf_counter()
-                infer_ms = (t1 - t0) * 1000.0
-
-                hands: dict[str, Hand] = {}
-                for lm, handed in zip(result.hand_landmarks, result.handedness):
-                    # Tasks labels assume a mirrored/selfie input, which is exactly what
-                    # we supply above; keep the user's natural Left/Right labels.
-                    label = handed[0].category_name
-                    pts = hand_points(lm, w, h)
-                    hands[label] = Hand(label, pts, is_fist(pts))  # fist computed once
 
                 # The UI lives in window pixels; rebuild it when the window is resized.
                 size = display_size(window_title, w, h)
@@ -902,79 +999,81 @@ def main() -> None:
                     view_f = view_w / w
                     layout = Layout(view_w, view_h, ui_scale(screen_h, view_h))
 
-                over_switch = False  # pinky resting on the background switch this frame
-                ui_point = None      # pinky position while it is on a panel (drawn as a ring)
+                # ---- gestures: run once per finished detection, not once per frame ----
+                # Detection runs in its own thread; the display uses its newest result.
+                seq, latest_hands, infer_ms = tracker.latest()
+                if seq != det_seq:
+                    det_seq, hands = seq, latest_hands
+                    stats.detection()
+                    over_switch = False  # pinky resting on the background switch this frame
+                    ui_point = None      # pinky position while it is on a panel (drawn as a ring)
 
-                # Two-hand-only undo/redo. Require a short closed/open state before transition.
-                if len(hands) == 2:
-                    closed_sides = [side for side, hand in hands.items() if hand.fist]
-                    # A single closing hand creates one action.  Two simultaneous fists
-                    # intentionally do nothing, avoiding ambiguous undo+redo sequences.
-                    if len(closed_sides) == 1:
-                        side = closed_sides[0]
-                        if action_armed[side] and time.monotonic() - painter.last_action > 0.55:
-                            (painter.undo if side == "Left" else painter.redo)()
-                            action_armed[side] = False
-                            painter.last_action = time.monotonic()
-                    for side, hand in hands.items():
-                        if not hand.fist:
-                            action_armed[side] = True
-                    painter.end_stroke()
-                else:
-                    # Restore gesture arming when the other hand leaves view.
-                    for side in action_armed:
-                        if side not in hands or not hands[side].fist:
-                            action_armed[side] = True
-                    if hands:
-                        hand = next(iter(hands.values()))
-                        pts = hand.pts
-                        index = pts[INDEX_TIP]
-                        pinky = pts[PINKY_TIP] * view_f  # the panels are in window pixels
-                        # Panels only react when no stroke is running.
-                        zone = layout.hit(pinky) if painter.previous is None else None
-                        if hand.fist:
-                            # A single fist is just "pen up" now; fists only matter
-                            # for two-hand undo/redo.
-                            painter.end_stroke()
-                        elif zone is not None:
-                            # Pinky on a panel: colors/eraser (left column), BG switch or
-                            # size slider (bottom right). A stroke in progress is never
-                            # interrupted, so drawing near the panels stays safe.
-                            painter.end_stroke()
-                            ui_point = (int(pinky[0]), int(pinky[1]))
-                            kind, value = zone
-                            if kind == "switch":
-                                over_switch = True
-                            elif kind == "slot":
-                                painter.select_slot(value)
-                            elif kind == "size":
-                                painter.set_size_fraction(value)
-                        elif finger_extended(pts, INDEX_MCP, INDEX_PIP, INDEX_TIP):
-                            # The active tool works exclusively while the index is extended.
-                            if painter.erasing:
-                                level = eraser_step(painter, pts)
-                                painter.set_status(f"ERASE {level}/{len(ERASER_SCALES)}")
+                    # Two-hand-only undo/redo. Require a short closed/open state before transition.
+                    if len(hands) == 2:
+                        closed_sides = [side for side, hand in hands.items() if hand.fist]
+                        # A single closing hand creates one action.  Two simultaneous fists
+                        # intentionally do nothing, avoiding ambiguous undo+redo sequences.
+                        if len(closed_sides) == 1:
+                            side = closed_sides[0]
+                            if action_armed[side] and time.monotonic() - painter.last_action > 0.55:
+                                (painter.undo if side == "Left" else painter.redo)()
+                                action_armed[side] = False
+                                painter.last_action = time.monotonic()
+                        for side, hand in hands.items():
+                            if not hand.fist:
+                                action_armed[side] = True
+                        painter.end_stroke()
+                    else:
+                        # Restore gesture arming when the other hand leaves view.
+                        for side in action_armed:
+                            if side not in hands or not hands[side].fist:
+                                action_armed[side] = True
+                        if hands:
+                            hand = next(iter(hands.values()))
+                            pts = hand.pts
+                            index = pts[INDEX_TIP]
+                            pinky = pts[PINKY_TIP] * view_f  # the panels are in window pixels
+                            # Panels only react when no stroke is running.
+                            zone = layout.hit(pinky) if painter.previous is None else None
+                            if hand.fist:
+                                # A single fist is just "pen up" now; fists only matter
+                                # for two-hand undo/redo.
+                                painter.end_stroke()
+                            elif zone is not None:
+                                # Pinky on a panel: colors/eraser (left column), BG switch or
+                                # size slider (bottom right). A stroke in progress is never
+                                # interrupted, so drawing near the panels stays safe.
+                                painter.end_stroke()
+                                ui_point = (int(pinky[0]), int(pinky[1]))
+                                kind, value = zone
+                                if kind == "switch":
+                                    over_switch = True
+                                elif kind == "slot":
+                                    painter.select_slot(value)
+                                elif kind == "size":
+                                    painter.set_size_fraction(value)
+                            elif finger_extended(pts, INDEX_MCP, INDEX_PIP, INDEX_TIP):
+                                # The active tool works exclusively while the index is extended.
+                                if painter.erasing:
+                                    level = eraser_step(painter, pts)
+                                    painter.set_status(f"ERASE {level}/{len(ERASER_SCALES)}")
+                                else:
+                                    painter.draw(index)
+                                    painter.set_status("DRAW: index extended")
                             else:
-                                painter.draw(index)
-                                painter.set_status("DRAW: index extended")
+                                painter.end_stroke()
                         else:
                             painter.end_stroke()
-                    else:
-                        painter.end_stroke()
+                    painter.update_switch_hover(over_switch)
 
-                painter.update_switch_hover(over_switch)
-
-                # ---- background: with the switch on, the camera image is replaced by beige ----
-                # Detection above already used the camera frame, so it is safe to overwrite it.
-                if painter.bg_on:
-                    np.copyto(frame, bg_img)
-
-                # ---- compositing: only the ink's bounding box is touched ----
-                # The frame is not needed afterwards, so draw on it directly (no copy).
-                painter.composite(frame)
+                # ---- background + ink (on a private copy: the camera frame is shared
+                # with the detection thread, so it is never drawn on) ----
+                out = bg_img.copy() if painter.bg_on else frame.copy()
+                # Compositing only touches the ink's bounding box.
+                painter.composite(out)
                 # Resize to the window now, so everything drawn below is sharp on screen.
-                view = frame if (view_w, view_h) == (w, h) else cv2.resize(
-                    frame, (view_w, view_h), interpolation=cv2.INTER_LINEAR)
+                view = out if (view_w, view_h) == (w, h) else cv2.resize(
+                    out, (view_w, view_h), interpolation=cv2.INTER_LINEAR)
                 # The skeleton, eraser radius and pen tip are drawn last, so paint never hides them.
                 for hand in hands.values():
                     draw_hand_landmarks(view, hand.pts * view_f, layout)
