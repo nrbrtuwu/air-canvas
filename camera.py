@@ -51,6 +51,8 @@ ERASER_EASING = 0.4                    # 0..1, how fast the eraser grows/shrinks
 ERASER_SLOT = len(PALETTE)  # the eraser button sits right after the last color
 SWITCH_DWELL = 0.30            # seconds the pinky must rest on the switch to flip it
 BG_COLOR = (196, 222, 235)     # beige page (BGR), shown instead of the camera when the switch is on
+# A picture with one of these names next to camera.py replaces the beige page.
+BG_IMAGE_NAMES = ("background.png", "background.jpg", "background.jpeg")
 
 
 # Left: color column, vertically centred.
@@ -115,6 +117,31 @@ def display_size(window: str, w: int, h: int) -> tuple[int, int]:
         return w, h
     f = min(dw / w, dh / h)
     return max(1, round(w * f)), max(1, round(h * f))
+
+
+def load_background(w: int, h: int) -> tuple[np.ndarray, bool]:
+    """The page shown when the BG switch is on: background.png/.jpg next to this file,
+    scaled to cover the frame (centre-cropped, never stretched), or plain beige.
+    Also returns whether the page is light, so markers drawn on it stay visible."""
+    folder = os.path.dirname(os.path.abspath(__file__))
+    for name in BG_IMAGE_NAMES:
+        path = os.path.join(folder, name)
+        if not os.path.isfile(path):
+            continue
+        # imdecode instead of imread: imread cannot open non-ASCII paths on Windows.
+        image = cv2.imdecode(np.fromfile(path, np.uint8), cv2.IMREAD_COLOR)
+        if image is None:
+            print(f"Background: could not read {name}, using beige")
+            break
+        ih, iw = image.shape[:2]
+        f = max(w / iw, h / ih)
+        sw, sh = max(w, round(iw * f)), max(h, round(ih * f))
+        scaled = cv2.resize(image, (sw, sh), interpolation=cv2.INTER_AREA if f < 1 else cv2.INTER_CUBIC)
+        x0, y0 = (sw - w) // 2, (sh - h) // 2
+        page = np.ascontiguousarray(scaled[y0:y0 + h, x0:x0 + w])
+        print(f"Background: {name} ({iw}x{ih})")
+        return page, float(cv2.cvtColor(page, cv2.COLOR_BGR2GRAY).mean()) > 128
+    return np.full((h, w, 3), BG_COLOR, np.uint8), True
 
 
 def ui_scale(screen_h: int, view_h: int) -> float:
@@ -579,7 +606,7 @@ class Painter:
         self._level_pending = 1
         self._level_votes = 0
         self.eraser_diam = float(self.eraser_size)  # eased diameter actually used
-        self.bg_on = False                          # beige background switch
+        self.bg_on = False                          # background switch (beige or background.png)
         self.switch_progress = 0.0                  # 0..1 dwell progress on the switch (for the UI)
         self._switch_since: Optional[float] = None
         self._switch_armed = True                   # must leave the switch before it can flip again
@@ -681,7 +708,7 @@ class Painter:
 
     def toggle_bg(self) -> None:
         self.bg_on = not self.bg_on
-        self.set_status("BEIGE BACKGROUND ON" if self.bg_on else "CAMERA BACKGROUND", 1.0)
+        self.set_status("BACKGROUND ON" if self.bg_on else "CAMERA BACKGROUND", 1.0)
 
     def update_switch_hover(self, over: bool) -> None:
         """Call once per frame. Flips the switch after the pinky rests on it for
@@ -877,7 +904,7 @@ FONT = cv2.FONT_HERSHEY_SIMPLEX
 
 
 def put_text_shadow(img, text, org, scale=0.55, color=(255, 255, 255), thickness=1) -> None:
-    """Text with a dark outline so it stays readable on the camera and on beige."""
+    """Text with a dark outline so it stays readable on the camera and on any background."""
     cv2.putText(img, text, org, FONT, scale, (0, 0, 0), thickness + 2, cv2.LINE_AA)
     cv2.putText(img, text, org, FONT, scale, color, thickness, cv2.LINE_AA)
 
@@ -919,8 +946,8 @@ def text_box(img: np.ndarray, lines: list[tuple[str, tuple]], x: int, y: int,
 
 
 def draw_switch(frame: np.ndarray, painter: Painter, layout: Layout) -> None:
-    """Vertical pill switch for the beige background (top of the right panel);
-    the knob is up when the beige page is on."""
+    """Vertical pill switch for the background page (top of the right panel);
+    the knob is up when the page (beige or background.png) is on."""
     px = layout.px
     cx, cy, r = layout.panel_x, layout.switch_y, px(SWITCH_R)
     y0, y1 = cy - px(SWITCH_HALF_LEN), cy + px(SWITCH_HALF_LEN)
@@ -1074,7 +1101,8 @@ def main() -> None:
     cam = CameraStream(cap, (w, h))
     # Per-side transition state prevents repeated undo/redo while a hand stays closed.
     action_armed = {"Left": True, "Right": True}
-    bg_img = np.full((h, w, 3), BG_COLOR, np.uint8)  # beige page, copied over the frame when the switch is on
+    # Page shown instead of the camera when the switch is on (background.png or beige).
+    bg_img, bg_light = load_background(w, h)
     try:
         with HandTracker(cam, args.model, acceleration, (det_w, det_h), w, h) as tracker:
             frame_seq = det_seq = 0
@@ -1179,12 +1207,13 @@ def main() -> None:
                 if painter.tip is not None:
                     tip = (int(painter.tip[0] * view_f), int(painter.tip[1] * view_f))
                     radius = max(1, int(painter.tip_radius * view_f))
-                    # Light rings disappear on beige, so use dark ones there.
+                    # Light rings disappear on a light page, so use dark ones there.
+                    dark_ring = painter.bg_on and bg_light
                     if painter.erasing:  # eraser outline shows exactly what will be wiped
-                        ring = (70, 70, 70) if painter.bg_on else (210, 210, 210)
+                        ring = (70, 70, 70) if dark_ring else (210, 210, 210)
                         cv2.circle(view, tip, radius, ring, layout.px(2), cv2.LINE_AA)
                     else:
-                        ring = (50, 50, 50) if painter.bg_on else (255, 255, 255)
+                        ring = (50, 50, 50) if dark_ring else (255, 255, 255)
                         cv2.circle(view, tip, radius, ring, layout.px(1), cv2.LINE_AA)
                 paint_ms = (time.perf_counter() - t1) * 1000.0
 
@@ -1209,13 +1238,11 @@ def main() -> None:
                     painter.toggle_bg()
                 if key == ord("s"):
                     name = f"drawing_{time.strftime('%Y%m%d_%H%M%S')}.png"
-                    if painter.bg_on:
-                        # Save what you see: the drawing on the beige page.
-                        page = bg_img.copy()
-                        cv2.copyTo(painter.canvas, painter.mask, page)
-                        cv2.imwrite(name, page)
-                    else:
-                        cv2.imwrite(name, painter.canvas)
+                    # Save what you see, without the UI: the drawing on the background
+                    # page, or on the current camera frame (full preview resolution).
+                    page = bg_img.copy() if painter.bg_on else frame.copy()
+                    painter.composite(page)
+                    cv2.imwrite(name, page)
                     painter.set_status(f"SAVED {name}", 1.5)
     finally:
         cam.stop()
