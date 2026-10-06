@@ -1,7 +1,10 @@
-"""Hand-tracked drawing canvas with two-hand gestures (MediaPipe + OpenCV).
+"""
+
+Hand-tracked drawing canvas with two-hand gestures (MediaPipe + OpenCV).
 
 Needs hand_landmarker.task next to this file (or --model PATH).
-Keys: S save, C clear, B background, [ / ] brush size, F FPS overlay, Q/Esc quit.
+Keys: S - save, C - clear, B - background, [  ] - brush size, F - FPS overlay, Q/Esc - quit.
+
 """
 from __future__ import annotations
 
@@ -179,6 +182,30 @@ class Layout:
                 return ("size", float(np.clip(frac, 0.0, 1.0)))
             return ("panel", None)
         return None
+
+# Brush stroke smoothing. Each stroke point is replaced by a Gaussian-weighted average
+# of its neighbours on BOTH sides, which removes hand tremor without the lag a normal
+# (one-sided) filter has. A point can only be finalised once STROKE_SMOOTH_RADIUS newer
+# points exist, so the newest bit of the stroke is drawn as a live preview that follows
+# the finger and is replaced by the smoothed ink a moment later.
+STROKE_SMOOTH_RADIUS = 2       # neighbours on each side (detections, ~25 ms apart)
+STROKE_SMOOTH_SIGMA = 1.6      # Gaussian width in points; higher = smoother, rounder corners
+SUBPIXEL_BITS = 4              # strokes are drawn with 1/16 px precision (cv2 "shift")
+_STROKE_WEIGHTS = np.exp(-0.5 * (np.arange(-STROKE_SMOOTH_RADIUS, STROKE_SMOOTH_RADIUS + 1)
+                                 / STROKE_SMOOTH_SIGMA) ** 2)
+
+
+def subpixel(points) -> np.ndarray:
+    """Float points -> int32 points for cv2 drawing with SUBPIXEL_BITS of precision."""
+    return np.round(np.asarray(points, np.float64) * (1 << SUBPIXEL_BITS)).astype(np.int32)
+
+
+def quad_curve(a: np.ndarray, c: np.ndarray, b: np.ndarray) -> np.ndarray:
+    """Points along the quadratic Bezier a -> b with control point c (~3 px apart)."""
+    length = float(np.hypot(*(c - a)) + np.hypot(*(b - c)))
+    t = np.linspace(0.0, 1.0, max(2, int(length / 3) + 2))[:, None]
+    return (1 - t) ** 2 * a + 2 * (1 - t) * t * c + t ** 2 * b
+
 
 # 1.0 = paint is opaque (one cheap masked copy). Below 1.0 the paint is blended
 # with the camera image (the old look used 0.88) at the cost of an extra pass.
@@ -558,6 +585,11 @@ class Painter:
         self._switch_armed = True                   # must leave the switch before it can flip again
         self.cursor = OneEuroCursor(min_cutoff, beta)
         self.previous: Optional[tuple[int, int]] = None
+        # Brush stroke in progress: filtered finger points, the smoothed points already
+        # turned into ink, and where that ink currently ends (see STROKE_SMOOTH_RADIUS).
+        self.stroke_raw: list[np.ndarray] = []
+        self.stroke_smooth: list[np.ndarray] = []
+        self.stroke_end: Optional[np.ndarray] = None
         self.status, self.status_until = "Draw", 0.0
         self.last_action = 0.0
 
@@ -719,6 +751,58 @@ class Painter:
             self.brush = int(round(MIN_BRUSH + frac * (MAX_BRUSH - MIN_BRUSH)))
             self.set_status(f"Brush {self.brush}px", 0.8)
 
+    # ---- smoothed brush strokes ----
+    def _smoothed(self, i: int) -> np.ndarray:
+        """Stroke point i averaged with its neighbours on both sides (fewer at the ends)."""
+        r = STROKE_SMOOTH_RADIUS
+        lo, hi = max(0, i - r), min(len(self.stroke_raw), i + r + 1)
+        weights = _STROKE_WEIGHTS[lo - i + r:hi - i + r]
+        return (np.asarray(self.stroke_raw[lo:hi]) * weights[:, None]).sum(axis=0) / weights.sum()
+
+    def _ink(self, points: np.ndarray) -> None:
+        """Draw a polyline of float points into the canvas and mask (anti-aliased, subpixel)."""
+        pts = subpixel(points)
+        cv2.polylines(self.canvas, [pts], False, self.color, self.brush, cv2.LINE_AA, SUBPIXEL_BITS)
+        cv2.polylines(self.mask, [pts], False, 255, self.brush, cv2.LINE_AA, SUBPIXEL_BITS)
+        lo, hi = points.min(axis=0), points.max(axis=0)
+        self._grow_box((int(lo[0]), int(lo[1])), (int(hi[0]) + 1, int(hi[1]) + 1), self.brush)
+
+    def _commit(self, point: np.ndarray) -> None:
+        """Turn the next smoothed point into ink. The ink runs through the midpoints
+        between smoothed points with quadratic curves, so it has no corners."""
+        self.stroke_smooth.append(point)
+        if len(self.stroke_smooth) == 1:
+            self.stroke_end = point
+            self._ink(np.array([point, point]))  # a tap still leaves a dot
+            return
+        control = self.stroke_smooth[-2]
+        end = (control + point) / 2
+        self._ink(quad_curve(self.stroke_end, control, end))
+        self.stroke_end = end
+
+    def _brush_step(self, point: np.ndarray) -> None:
+        self.stroke_raw.append(point)
+        # Point i is final once it has STROKE_SMOOTH_RADIUS newer neighbours.
+        while len(self.stroke_smooth) < len(self.stroke_raw) - STROKE_SMOOTH_RADIUS:
+            self._commit(self._smoothed(len(self.stroke_smooth)))
+
+    def _finish_brush_stroke(self) -> None:
+        """Pen up: smooth the remaining points with what is known and ink them."""
+        while len(self.stroke_smooth) < len(self.stroke_raw):
+            self._commit(self._smoothed(len(self.stroke_smooth)))
+        if len(self.stroke_smooth) >= 2:
+            # Finish where the finger stopped: the last averages lean back into the stroke.
+            self._ink(quad_curve(self.stroke_end, self.stroke_smooth[-1], self.stroke_raw[-1]))
+        self.stroke_raw, self.stroke_smooth, self.stroke_end = [], [], None
+
+    def draw_pending(self, frame: np.ndarray) -> None:
+        """Live preview of the not-yet-smoothed end of the stroke, from the end of the
+        ink to the finger, so the brush never lags behind (drawn on the frame only)."""
+        if self.stroke_end is None or len(self.stroke_raw) <= len(self.stroke_smooth):
+            return
+        tail = [self.stroke_end, self.stroke_smooth[-1]] + self.stroke_raw[len(self.stroke_smooth):]
+        cv2.polylines(frame, [subpixel(tail)], False, self.color, self.brush, cv2.LINE_AA, SUBPIXEL_BITS)
+
     # ---- drawing ----
     def draw(self, raw: np.ndarray) -> None:
         """Extend the current stroke with the active tool (brush or eraser)."""
@@ -742,16 +826,15 @@ class Painter:
             cv2.line(self.canvas, self.previous, current, (0, 0, 0), width, cv2.LINE_8)
             cv2.line(self.mask, self.previous, current, 0, width, cv2.LINE_8)
             self._erased = True
-        else:
-            # Short gaps are bridged naturally by a continuous stabilized segment.
-            cv2.line(self.canvas, self.previous, current, self.color, self.brush, cv2.LINE_AA)
-            cv2.line(self.mask, self.previous, current, 255, self.brush, cv2.LINE_AA)
-            self._grow_box(self.previous, current, self.brush)
+        if not erase:  # the brush draws through the smoothing pipeline (also the first point)
+            self._brush_step(np.asarray(p, np.float64))
         self.previous = current
         self.tip = current
         self.tip_radius = max(1, int(round(self.eraser_diam)) // 2) if erase else max(4, self.brush // 2 + 3)
 
     def end_stroke(self) -> None:
+        if self.stroke_raw:
+            self._finish_brush_stroke()
         self.previous = None
         self.tip = None
         self.cursor.reset()
@@ -761,18 +844,19 @@ class Painter:
             self._recompute_box()
 
     def composite(self, frame: np.ndarray) -> None:
-        """Paint the ink onto ``frame`` in place, touching only the ink's bounding box."""
-        if self.ink_box is None:
-            return
-        x0, y0, x1, y1 = self.ink_box
-        dst = frame[y0:y1, x0:x1]
-        src = self.canvas[y0:y1, x0:x1]
-        m = self.mask[y0:y1, x0:x1]
-        if INK_OPACITY >= 0.999:
-            cv2.copyTo(src, m, dst)
-        else:
-            blended = cv2.addWeighted(dst, 1.0 - INK_OPACITY, src, INK_OPACITY, 0)
-            cv2.copyTo(blended, m, dst)
+        """Paint the ink (and the live stroke preview) onto ``frame`` in place,
+        touching only the ink's bounding box."""
+        if self.ink_box is not None:
+            x0, y0, x1, y1 = self.ink_box
+            dst = frame[y0:y1, x0:x1]
+            src = self.canvas[y0:y1, x0:x1]
+            m = self.mask[y0:y1, x0:x1]
+            if INK_OPACITY >= 0.999:
+                cv2.copyTo(src, m, dst)
+            else:
+                blended = cv2.addWeighted(dst, 1.0 - INK_OPACITY, src, INK_OPACITY, 0)
+                cv2.copyTo(blended, m, dst)
+        self.draw_pending(frame)
 
 
 def eraser_step(painter: Painter, pts: np.ndarray) -> int:
