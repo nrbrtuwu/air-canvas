@@ -46,16 +46,22 @@ ERASER_SCALES = (1.0, 1.7, 2.5, 3.4)   # diameter multiplier for 1, 2, 3, 4 fing
 LEVEL_CONFIRM_FRAMES = 2               # a new finger count must persist this many frames
 ERASER_EASING = 0.4                    # 0..1, how fast the eraser grows/shrinks per frame
 ERASER_SLOT = len(PALETTE)  # the eraser button sits right after the last color
-SWITCH_SLOT = ERASER_SLOT + 1  # the beige-background switch sits right after the eraser
-SWITCH_HALF_WIDTH = 34         # pinky hit zone (px) either side of the switch centre
 SWITCH_DWELL = 0.30            # seconds the pinky must rest on the switch to flip it
 BG_COLOR = (196, 222, 235)     # beige page (BGR), shown instead of the camera when the switch is on
 
 
-SLOT_STEP = 58                 # vertical distance between buttons in the color column
-COLUMN_X = 45                  # horizontal centre of the color column (bottom left)
-PANEL_W, PANEL_H = 520, 80     # bottom-right panel: BG switch + size slider
-SLOT_HIT = 25                  # pinky must be this close (px) to a color/eraser button
+# Left: color column, vertically centred.
+SLOT_STEP = 68                 # vertical distance between buttons in the color column
+COLUMN_X = 62                  # horizontal centre of the color column
+COLUMN_HALF_W = 50             # half width of the column background
+SLOT_R = 26                    # radius of a color button
+SLOT_HIT = 33                  # pinky must be this close (px) to a color/eraser button
+# Right: BG switch on top, vertical size slider below; vertically centred.
+PANEL_W, PANEL_H = 124, 625
+SWITCH_Y = 75                  # switch centre, from the panel top
+SWITCH_HALF_LEN, SWITCH_R = 26, 22   # vertical pill: half distance between end centres, radius
+SLIDER_TOP, SLIDER_BOTTOM = 190, 535  # slider ends, from the panel top (top = biggest)
+SLIDER_HALF_W, KNOB_R = 12, 22
 # All UI sizes above are in screen pixels on a 1080p monitor. They are scaled to the
 # monitor resolution, not to the preview resolution. The UI is drawn after the frame
 # has been resized to the window, so it is never stretched (and never pixelated).
@@ -110,16 +116,16 @@ def display_size(window: str, w: int, h: int) -> tuple[int, int]:
 
 def ui_scale(screen_h: int, view_h: int) -> float:
     """Display pixels per UI pixel. Follows the monitor resolution; only shrinks when
-    the window is too short for the status line, stats box and color column together
-    (about 840 UI pixels)."""
-    return float(np.clip(screen_h / UI_REFERENCE_HEIGHT, 0.5, max(0.5, view_h / 840)))
+    the window is too short for the color column (the tallest control)."""
+    column_h = ERASER_SLOT * SLOT_STEP + 2 * COLUMN_HALF_W
+    return float(np.clip(screen_h / UI_REFERENCE_HEIGHT, 0.4, max(0.4, (view_h - 40) / column_h)))
 
 
 class Layout:
     """Screen positions of the on-screen controls for one frame size and UI scale.
 
-    Bottom left: a vertical column, colors on top and the eraser at the bottom.
-    Bottom right: the background switch and the size slider."""
+    Left, vertically centred: a column with the colors on top and the eraser at the bottom.
+    Right, vertically centred: the background switch with the size slider below it."""
 
     def __init__(self, w: int, h: int, s: float = 1.0) -> None:
         self.w, self.h, self.s = w, h, s
@@ -127,15 +133,15 @@ class Layout:
         self.column_x = px(COLUMN_X)
         self.slot_step = px(SLOT_STEP)
         self.slot_hit = px(SLOT_HIT)
-        self.switch_half = px(SWITCH_HALF_WIDTH)
+        self.col_rect = (self.column_x - px(COLUMN_HALF_W), self.slot_y(0) - px(COLUMN_HALF_W),
+                         self.column_x + px(COLUMN_HALF_W), self.slot_y(ERASER_SLOT) + px(COLUMN_HALF_W))
         pad = px(8)
-        panel_w, panel_h = min(px(PANEL_W), w // 2), px(PANEL_H)
-        self.col_rect = (self.column_x - px(37), self.slot_y(0) - px(35), self.column_x + px(37), h - pad)
-        self.panel_rect = (w - panel_w - pad, h - panel_h - pad, w - pad, h - pad)
-        self.cy = h - pad - panel_h // 2        # vertical centre of the right panel
-        self.switch_x = self.panel_rect[0] + px(50)
-        self.slider_x0 = self.switch_x + px(90)
-        self.slider_x1 = w - px(30)
+        top = h // 2 - px(PANEL_H) // 2
+        self.panel_rect = (w - pad - px(PANEL_W), top, w - pad, top + px(PANEL_H))
+        self.panel_x = (self.panel_rect[0] + self.panel_rect[2]) // 2   # horizontal centre
+        self.switch_y = top + px(SWITCH_Y)
+        self.slider_y0 = top + px(SLIDER_TOP)       # biggest size
+        self.slider_y1 = top + px(SLIDER_BOTTOM)    # smallest size
 
     def px(self, v: float) -> int:
         """A UI size in frame pixels (never below 1)."""
@@ -146,10 +152,11 @@ class Layout:
 
     def slot_y(self, slot: int) -> int:
         """Vertical centre of a column button (slot 0 at the top, eraser at the bottom)."""
-        return self.h - self.px(45) - (ERASER_SLOT - slot) * self.slot_step
+        return self.h // 2 + int(round((slot - ERASER_SLOT / 2) * self.slot_step))
 
-    def slider_x(self, frac: float) -> int:
-        return int(round(self.slider_x0 + frac * (self.slider_x1 - self.slider_x0)))
+    def slider_y(self, frac: float) -> int:
+        """Slider position for a size fraction (0 = bottom/smallest, 1 = top/biggest)."""
+        return int(round(self.slider_y1 - frac * (self.slider_y1 - self.slider_y0)))
 
     @staticmethod
     def _inside(p, rect, margin: int = 0) -> bool:
@@ -165,10 +172,10 @@ class Layout:
                 return ("slot", slot)
             return ("panel", None)
         if self._inside(p, self.panel_rect, self.px(10)):
-            if abs(p[0] - self.switch_x) < self.switch_half:
+            if abs(p[1] - self.switch_y) < self.px(SWITCH_HALF_LEN + SWITCH_R + 12):
                 return ("switch", None)
-            if self.slider_x0 - self.px(20) <= p[0] <= self.slider_x1 + self.px(20):
-                frac = (p[0] - self.slider_x0) / (self.slider_x1 - self.slider_x0)
+            if self.slider_y0 - self.px(20) <= p[1] <= self.slider_y1 + self.px(20):
+                frac = (self.slider_y1 - p[1]) / (self.slider_y1 - self.slider_y0)
                 return ("size", float(np.clip(frac, 0.0, 1.0)))
             return ("panel", None)
         return None
@@ -828,61 +835,69 @@ def text_box(img: np.ndarray, lines: list[tuple[str, tuple]], x: int, y: int,
 
 
 def draw_switch(frame: np.ndarray, painter: Painter, layout: Layout) -> None:
-    """Pill-shaped on/off switch for the beige background (bottom-right panel)."""
+    """Vertical pill switch for the beige background (top of the right panel);
+    the knob is up when the beige page is on."""
     px = layout.px
-    sx, cy, r = layout.switch_x, layout.cy, px(13)
-    x0, x1 = sx - px(26), sx + px(26)
+    cx, cy, r = layout.panel_x, layout.switch_y, px(SWITCH_R)
+    y0, y1 = cy - px(SWITCH_HALF_LEN), cy + px(SWITCH_HALF_LEN)
     track = (110, 190, 100) if painter.bg_on else (90, 90, 90)
-    cv2.circle(frame, (x0, cy), r, track, -1, cv2.LINE_AA)
-    cv2.circle(frame, (x1, cy), r, track, -1, cv2.LINE_AA)
-    cv2.rectangle(frame, (x0, cy - r), (x1, cy + r), track, -1)
-    cv2.circle(frame, (x1 if painter.bg_on else x0, cy), r - px(3), (245, 245, 245), -1, cv2.LINE_AA)
-    cv2.putText(frame, "BG", (x1 + r + px(8), cy + px(6)), FONT, layout.font(.55), (235, 235, 235),
+    cv2.circle(frame, (cx, y0), r, track, -1, cv2.LINE_AA)
+    cv2.circle(frame, (cx, y1), r, track, -1, cv2.LINE_AA)
+    cv2.rectangle(frame, (cx - r, y0), (cx + r, y1), track, -1)
+    cv2.circle(frame, (cx, y0 if painter.bg_on else y1), r - px(4), (245, 245, 245), -1, cv2.LINE_AA)
+    label_y = y1 + r + px(26)
+    (tw, _), _ = cv2.getTextSize("BG", FONT, layout.font(0.6), px(1))
+    cv2.putText(frame, "BG", (cx - tw // 2, label_y), FONT, layout.font(0.6), (235, 235, 235),
                 px(1), cv2.LINE_AA)
-    if painter.switch_progress > 0:  # dwell progress bar under the switch
-        end = x0 - r + int((x1 - x0 + 2 * r) * painter.switch_progress)
-        cv2.line(frame, (x0 - r, cy + px(24)), (end, cy + px(24)), (255, 255, 255), px(3))
+    if painter.switch_progress > 0:  # dwell progress bar under the label
+        half = px(PANEL_W) // 2 - px(14)
+        end = cx - half + int(2 * half * painter.switch_progress)
+        cv2.line(frame, (cx - half, label_y + px(12)), (end, label_y + px(12)), (255, 255, 255), px(4))
 
 
 def draw_ui(frame: np.ndarray, painter: Painter, layout: Layout, stats: PerfStats, show_stats: bool) -> None:
     h, w = frame.shape[:2]
     px = layout.px
 
-    # ---- bottom left: vertical color column, eraser at the bottom ----
+    # ---- left, vertically centred: color column, eraser at the bottom ----
     x0, y0, x1, y1 = layout.col_rect
     cx = layout.column_x
     cv2.rectangle(frame, (x0, y0), (x1, y1), (25, 25, 25), -1)
     for i, col in enumerate(PALETTE):
         cy = layout.slot_y(i)
-        cv2.circle(frame, (cx, cy), px(18), col, -1, cv2.LINE_AA)
-        cv2.circle(frame, (cx, cy), px(18), (110, 110, 110), px(1), cv2.LINE_AA)  # keeps black visible
+        cv2.circle(frame, (cx, cy), px(SLOT_R), col, -1, cv2.LINE_AA)
+        cv2.circle(frame, (cx, cy), px(SLOT_R), (110, 110, 110), px(1), cv2.LINE_AA)  # keeps black visible
         if not painter.erasing and col == painter.color:
-            cv2.circle(frame, (cx, cy), px(22), (255, 255, 255), px(2), cv2.LINE_AA)
+            cv2.circle(frame, (cx, cy), px(SLOT_R + 6), (255, 255, 255), px(3), cv2.LINE_AA)
     ey = layout.slot_y(ERASER_SLOT)
-    ew, eh = px(17), px(12)
+    ew, eh = px(25), px(17)
     cv2.rectangle(frame, (cx - ew, ey - eh), (cx + ew, ey + eh), (225, 225, 225), -1)
-    cv2.rectangle(frame, (cx - ew, ey - eh), (cx - px(3), ey + eh), (170, 120, 255), -1)
+    cv2.rectangle(frame, (cx - ew, ey - eh), (cx - px(4), ey + eh), (170, 120, 255), -1)
     cv2.rectangle(frame, (cx - ew, ey - eh), (cx + ew, ey + eh), (90, 90, 90), px(1), cv2.LINE_AA)
     if painter.erasing:
-        cv2.rectangle(frame, (cx - px(23), ey - px(18)), (cx + px(23), ey + px(18)), (255, 255, 255),
-                      px(2), cv2.LINE_AA)
+        cv2.rectangle(frame, (cx - ew - px(7), ey - eh - px(7)), (cx + ew + px(7), ey + eh + px(7)),
+                      (255, 255, 255), px(3), cv2.LINE_AA)
 
-    # ---- bottom right: background switch + size slider ----
+    # ---- right, vertically centred: background switch, size slider below ----
     px0, py0, px1, py1 = layout.panel_rect
     cv2.rectangle(frame, (px0, py0), (px1, py1), (25, 25, 25), -1)
     draw_switch(frame, painter, layout)
-    sx0, sx1, cy = layout.slider_x0, layout.slider_x1, layout.cy
-    cv2.rectangle(frame, (sx0, cy - px(8)), (sx1, cy + px(8)), (75, 75, 75), -1)
-    kx = layout.slider_x(painter.size_fraction())
+    sx, sy0, sy1, sw = layout.panel_x, layout.slider_y0, layout.slider_y1, px(SLIDER_HALF_W)
+    cv2.rectangle(frame, (sx - sw, sy0), (sx + sw, sy1), (75, 75, 75), -1)
+    ky = layout.slider_y(painter.size_fraction())
     fill = (170, 170, 170) if painter.erasing else painter.color
-    cv2.rectangle(frame, (sx0, cy - px(8)), (kx, cy + px(8)), fill, -1)
-    cv2.circle(frame, (kx, cy), px(12), (245, 245, 245), -1, cv2.LINE_AA)
-    cv2.circle(frame, (kx, cy), px(12), (60, 60, 60), px(1), cv2.LINE_AA)
+    cv2.rectangle(frame, (sx - sw, ky), (sx + sw, sy1), fill, -1)
+    cv2.circle(frame, (sx, ky), px(KNOB_R), (245, 245, 245), -1, cv2.LINE_AA)
+    cv2.circle(frame, (sx, ky), px(KNOB_R), (60, 60, 60), px(1), cv2.LINE_AA)
     if painter.erasing:
-        label = f"Eraser {painter.eraser_level}/{len(ERASER_SCALES)}  {painter.eraser_target():.0f}px"
+        lines = [f"Eraser {painter.eraser_level}/{len(ERASER_SCALES)}", f"{painter.eraser_target():.0f}px"]
     else:
-        label = f"Brush {painter.brush}px"
-    put_text_shadow(frame, label, (sx0, cy - px(20)), layout.font(0.5), thickness=px(1))
+        lines = ["Brush", f"{painter.brush}px"]
+    ty = sy1 + px(KNOB_R) + px(20)
+    for line in lines:  # centred under the slider
+        (tw, _), _ = cv2.getTextSize(line, FONT, layout.font(0.5), px(1))
+        put_text_shadow(frame, line, (sx - tw // 2, ty), layout.font(0.5), thickness=px(1))
+        ty += px(20)
 
     # ---- status line, top centre (on a shadow box) ----
     idle = ("Erase: index up, more fingers = bigger | Pinky on panels: tools, size & BG" if painter.erasing
@@ -891,7 +906,7 @@ def draw_ui(frame: np.ndarray, painter: Painter, layout: Layout, stats: PerfStat
     bottom = text_box(frame, [(text, (255, 255, 255))], w // 2, px(14), layout,
                       layout.font(0.62), px(2), center=True)
 
-    # ---- stats, top left below the status line (on a shadow box) ----
+    # ---- stats, top left beside the color column (on a shadow box) ----
     if show_stats:
         fps_color = (80, 255, 80) if stats.fps >= 24 else (0, 200, 255) if stats.fps >= 15 else (60, 60, 255)
         white = (255, 255, 255)
@@ -900,7 +915,7 @@ def draw_ui(frame: np.ndarray, painter: Painter, layout: Layout, stats: PerfStat
             (f"Frame: {stats.frametime:5.1f} ms (worst {stats.worst:.0f})", white),
             (f"Detect: {stats.infer:5.1f} ms ({stats.detect_fps:.0f}/s)", white),
             (f"Paint: {stats.paint:5.1f} ms", white),
-        ], px(14), bottom + px(12), layout, layout.font(0.55), px(1))
+        ], layout.col_rect[2] + px(14), bottom + px(12), layout, layout.font(0.55), px(1))
 
 
 # --------------------------------------------------------------------------
