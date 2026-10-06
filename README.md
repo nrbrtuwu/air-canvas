@@ -1,4 +1,4 @@
-# Camera Drawer
+# air-canvas
 
 Draw in the air with your finger. A webcam tracks your hands (MediaPipe) and your index finger becomes a brush. Two people can draw at the same time.
 
