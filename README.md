@@ -53,3 +53,8 @@ By default the app restarts itself after a crash and writes the error to `crash.
 
 - If the window doesn't open (Wayland): `QT_QPA_PLATFORM=xcb python camera.py`
 - `sudo apt install python3-tk` lets the UI detect your screen size (otherwise it assumes 1080p).
+
+
+## Disclaimer
+
+- This project was made for a High School show-off day, so keep in mind that this project probably will not be updated in the future.
