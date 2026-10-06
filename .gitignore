@@ -1,0 +1,4 @@
+__pycache__/
+*.pyc
+drawing_*.png
+old-versions/
