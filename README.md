@@ -58,3 +58,4 @@ By default the app restarts itself after a crash and writes the error to `crash.
 ## Disclaimer
 
 - This project was made for a High School show-off day, so keep in mind that this project probably will not be updated in the future.
+- **This project was mainly vibe-coded, so do not expect the best ux...**
