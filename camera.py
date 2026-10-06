@@ -50,6 +50,9 @@ LEVEL_CONFIRM_FRAMES = 2               # a new finger count must persist this ma
 ERASER_EASING = 0.4                    # 0..1, how fast the eraser grows/shrinks per frame
 ERASER_SLOT = len(PALETTE)  # the eraser button sits right after the last color
 SWITCH_DWELL = 0.30            # seconds the pinky must rest on the switch to flip it
+CLEAR_DWELL = 1.2              # seconds the pinky must rest on Clear (long, so it is never an accident)
+PEN_JUMP = 0.2                 # a hand this far (fraction of frame width) from a pen's last spot is a new hand
+LOW_LIGHT = 55                 # mean camera brightness (0..255) below which a "too dark" warning shows
 BG_COLOR = (196, 222, 235)     # beige page (BGR), shown instead of the camera when the switch is on
 # A picture with one of these names next to camera.py replaces the beige page.
 BG_IMAGE_NAMES = ("background.png", "background.jpg", "background.jpeg")
@@ -61,12 +64,13 @@ COLUMN_X = 62                  # horizontal centre of the color column
 COLUMN_HALF_W = 50             # half width of the column background
 SLOT_R = 26                    # radius of a color button
 SLOT_HIT = 33                  # pinky must be this close (px) to a color/eraser button
-# Right: BG switch on top, vertical size slider below; vertically centred.
-PANEL_W, PANEL_H = 124, 625
+# Right: BG switch on top, vertical size slider, Clear button; vertically centred.
+PANEL_W, PANEL_H = 124, 670
 SWITCH_Y = 75                  # switch centre, from the panel top
 SWITCH_HALF_LEN, SWITCH_R = 26, 22   # vertical pill: half distance between end centres, radius
-SLIDER_TOP, SLIDER_BOTTOM = 190, 535  # slider ends, from the panel top (top = biggest)
+SLIDER_TOP, SLIDER_BOTTOM = 190, 470  # slider ends, from the panel top (top = biggest)
 SLIDER_HALF_W, KNOB_R = 12, 22
+CLEAR_Y, CLEAR_HALF_H = 610, 34       # Clear button centre (from the panel top) and half height
 # All UI sizes above are in screen pixels on a 1080p monitor. They are scaled to the
 # monitor resolution, not to the preview resolution. The UI is drawn after the frame
 # has been resized to the window, so it is never stretched (and never pixelated).
@@ -146,16 +150,16 @@ def load_background(w: int, h: int) -> tuple[np.ndarray, bool]:
 
 def ui_scale(screen_h: int, view_h: int) -> float:
     """Display pixels per UI pixel. Follows the monitor resolution; only shrinks when
-    the window is too short for the color column (the tallest control)."""
-    column_h = ERASER_SLOT * SLOT_STEP + 2 * COLUMN_HALF_W
-    return float(np.clip(screen_h / UI_REFERENCE_HEIGHT, 0.4, max(0.4, (view_h - 40) / column_h)))
+    the window is too short for the side panels."""
+    tallest = max(ERASER_SLOT * SLOT_STEP + 2 * COLUMN_HALF_W, PANEL_H)
+    return float(np.clip(screen_h / UI_REFERENCE_HEIGHT, 0.4, max(0.4, (view_h - 40) / tallest)))
 
 
 class Layout:
     """Screen positions of the on-screen controls for one frame size and UI scale.
 
     Left, vertically centred: a column with the colors on top and the eraser at the bottom.
-    Right, vertically centred: the background switch with the size slider below it."""
+    Right, vertically centred: the background switch, the size slider and Clear."""
 
     def __init__(self, w: int, h: int, s: float = 1.0) -> None:
         self.w, self.h, self.s = w, h, s
@@ -172,6 +176,7 @@ class Layout:
         self.switch_y = top + px(SWITCH_Y)
         self.slider_y0 = top + px(SLIDER_TOP)       # biggest size
         self.slider_y1 = top + px(SLIDER_BOTTOM)    # smallest size
+        self.clear_y = top + px(CLEAR_Y)
 
     def px(self, v: float) -> int:
         """A UI size in frame pixels (never below 1)."""
@@ -195,7 +200,7 @@ class Layout:
 
     def hit(self, p) -> Optional[tuple]:
         """What a point is over: ("slot", i), ("switch", None), ("size", 0..1),
-        ("panel", None) for empty space on a panel, or None when off the panels."""
+        ("clear", None), ("panel", None) for empty space on a panel, or None."""
         if self._inside(p, self.col_rect, self.px(10)):
             slot = min(range(ERASER_SLOT + 1), key=lambda i: abs(p[1] - self.slot_y(i)))
             if abs(p[1] - self.slot_y(slot)) < self.slot_hit:
@@ -207,6 +212,8 @@ class Layout:
             if self.slider_y0 - self.px(20) <= p[1] <= self.slider_y1 + self.px(20):
                 frac = (self.slider_y1 - p[1]) / (self.slider_y1 - self.slider_y0)
                 return ("size", float(np.clip(frac, 0.0, 1.0)))
+            if abs(p[1] - self.clear_y) < self.px(CLEAR_HALF_H + 6):
+                return ("clear", None)
             return ("panel", None)
         return None
 
@@ -301,39 +308,70 @@ class Hand:
 # --------------------------------------------------------------------------
 # Threaded camera
 # --------------------------------------------------------------------------
+def open_camera(index: int, w: int, h: int) -> Optional[cv2.VideoCapture]:
+    """Open and configure the camera; None if it cannot deliver a frame."""
+    cap = cv2.VideoCapture(index)
+    if not cap.isOpened():
+        cap.release()
+        return None
+    # MJPG usually unlocks 30 fps at 1080p (raw YUYV at 1080p is often capped at 5 fps).
+    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, w)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, h)
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    ok, _ = cap.read()
+    if not ok:
+        cap.release()
+        return None
+    return cap
+
+
 class CameraStream:
     """Grabs frames in a background thread so the main loop never blocks on I/O.
     Frames are resized to the preview size and mirrored here, off the main thread.
-    Published frames are shared between threads, so treat them as read-only."""
+    Published frames are shared between threads, so treat them as read-only.
+    If the camera stops delivering (cable pulled, capture card hiccup), it is
+    reopened every second until it works again."""
 
-    def __init__(self, cap: cv2.VideoCapture, size: tuple[int, int]):
-        self.cap = cap
+    def __init__(self, cap: cv2.VideoCapture, size: tuple[int, int], reopen):
+        self.cap: Optional[cv2.VideoCapture] = cap
         self.size = size
+        self.reopen = reopen              # () -> Optional[VideoCapture]
         self.cond = threading.Condition()
         self.frame: Optional[np.ndarray] = None
         self.seq = 0
+        self.connected = True
         self.running = True
         self.thread = threading.Thread(target=self._run, daemon=True)
         self.thread.start()
 
     def _run(self) -> None:
         while self.running:
+            if self.cap is None:
+                time.sleep(1.0)
+                self.cap = self.reopen()
+                if self.cap is not None:
+                    print("Camera reconnected")
+                continue
             ok, frame = self.cap.read()
-            if ok:
-                if (frame.shape[1], frame.shape[0]) != self.size:
-                    frame = cv2.resize(frame, self.size, interpolation=cv2.INTER_LINEAR)
-                frame = cv2.flip(frame, 1)
+            if not ok:
+                print("Camera lost, reconnecting...")
+                self.connected = False
+                self.cap.release()
+                self.cap = None
+                continue
+            if (frame.shape[1], frame.shape[0]) != self.size:
+                frame = cv2.resize(frame, self.size, interpolation=cv2.INTER_LINEAR)
+            frame = cv2.flip(frame, 1)
             with self.cond:
-                if not ok:
-                    self.running = False
-                else:
-                    self.frame = frame
-                    self.seq += 1
+                self.frame = frame
+                self.seq += 1
+                self.connected = True
                 self.cond.notify_all()
 
     def read(self, after: int, timeout: float = 1.0) -> tuple[int, Optional[np.ndarray]]:
         """Wait for a frame newer than sequence number ``after`` (older frames are
-        dropped). Returns (seq, frame), or (after, None) on timeout / end of stream."""
+        dropped). Returns (seq, frame), or (after, None) on timeout."""
         with self.cond:
             self.cond.wait_for(lambda: self.seq != after or not self.running, timeout)
             if self.seq == after:
@@ -342,7 +380,9 @@ class CameraStream:
 
     def stop(self) -> None:
         self.running = False
-        self.thread.join(timeout=1.0)
+        self.thread.join(timeout=2.0)
+        if self.cap is not None:
+            self.cap.release()
 
 
 def detector_process(conn, model_path: str, use_gpu: bool) -> None:
@@ -397,7 +437,7 @@ class HandTracker:
         self.cam, self.acceleration = cam, acceleration
         self.det_size, self.scale = det_size, np.array([w, h], np.float32)
         self.lock = threading.Lock()
-        self.hands: dict[str, Hand] = {}
+        self.hands: list[Hand] = []
         self.infer_ms = 0.0
         self.seq = 0                      # bumps once per finished detection
         self.error: Optional[BaseException] = None
@@ -417,7 +457,7 @@ class HandTracker:
     def _run(self) -> None:
         frame_seq, timestamp_ms = 0, 0
         try:
-            while self.running and self.cam.running:
+            while self.running:
                 frame_seq, frame = self.cam.read(frame_seq)
                 if frame is None:
                     continue
@@ -426,17 +466,17 @@ class HandTracker:
                 timestamp_ms = max(timestamp_ms + 1, int(time.monotonic() * 1000))
                 self.conn.send((timestamp_ms, rgb))
                 _, found = self.conn.recv()
-                hands: dict[str, Hand] = {}
+                hands = []
                 for label, norm in found:
                     pts = norm * self.scale
-                    hands[label] = Hand(label, pts, is_fist(pts))  # fist computed once
+                    hands.append(Hand(label, pts, is_fist(pts)))  # fist computed once
                 with self.lock:
                     self.hands, self.seq = hands, self.seq + 1
                     self.infer_ms = (time.perf_counter() - t0) * 1000.0
         except BaseException as error:  # surfaced in the main loop
             self.error = error
 
-    def latest(self) -> tuple[int, dict[str, Hand], float]:
+    def latest(self) -> tuple[int, list[Hand], float]:
         with self.lock:
             return self.seq, self.hands, self.infer_ms
 
@@ -585,6 +625,63 @@ class OneEuroCursor:
         self.dx[:] = 0.0
 
 
+class Dwell:
+    """A pinky-held button: fires once after resting on it for ``seconds``, then the
+    pinky must leave before it can fire again, so hovering never repeats it."""
+
+    def __init__(self, seconds: float) -> None:
+        self.seconds = seconds
+        self.progress = 0.0           # 0..1, for the UI
+        self._since: Optional[float] = None
+        self._armed = True
+
+    def update(self, over: bool) -> bool:
+        """Call once per detection; True on the update the button fires."""
+        if not over:
+            self._since, self._armed, self.progress = None, True, 0.0
+            return False
+        if not self._armed:
+            return False
+        now = time.monotonic()
+        if self._since is None:
+            self._since = now
+        held = now - self._since
+        self.progress = min(1.0, held / self.seconds)
+        if held < self.seconds:
+            return False
+        self._since, self._armed, self.progress = None, False, 0.0
+        return True
+
+
+class Pen:
+    """Stroke state for one hand, so two people can draw at the same time. Tool,
+    color and size are shared (on the Painter); a stroke keeps the color and width
+    it started with, so changing them never recolors someone's stroke halfway."""
+
+    def __init__(self, min_cutoff: float, beta: float) -> None:
+        self.cursor = OneEuroCursor(min_cutoff, beta)
+        self.pos: Optional[np.ndarray] = None       # last palm position, to recognise the hand
+        self.vel = np.zeros(2)                      # palm movement per detection (smoothed)
+        self.previous: Optional[tuple[int, int]] = None  # last point; None = no stroke running
+        self.tip: Optional[tuple[int, int]] = None  # current pen/eraser tip (for the ring marker)
+        self.tip_radius = 6
+        self.color = PALETTE[0]
+        self.width = 10
+        # Brush stroke in progress: filtered finger points, the smoothed points already
+        # turned into ink, and where that ink currently ends (see STROKE_SMOOTH_RADIUS).
+        self.stroke_raw: list[np.ndarray] = []
+        self.stroke_smooth: list[np.ndarray] = []
+        self.stroke_end: Optional[np.ndarray] = None
+        self.eraser_level = 1     # committed finger count, 1..4
+        self._level_pending = 1
+        self._level_votes = 0
+        self.eraser_diam = 0.0    # eased diameter actually used
+
+    @property
+    def active(self) -> bool:
+        return self.previous is not None
+
+
 class Painter:
     def __init__(self, w: int, h: int, min_cutoff: float = 1.0, beta: float = 0.025):
         self.w, self.h = w, h
@@ -594,31 +691,15 @@ class Painter:
         # Compositing only touches this region.
         self.ink_box: Optional[tuple[int, int, int, int]] = None
         self._erased = False
-        self.tip: Optional[tuple[int, int]] = None  # current pen/eraser tip (for the ring marker)
-        self.tip_radius = 6
-        self.undo_stack: list[tuple] = []
-        self.redo_stack: list[tuple] = []
         self.tool = "draw"        # "draw" or "erase"
         self.color = PALETTE[0]
         self.brush = 10
         self.eraser_size = 48     # base diameter in px (index finger only)
-        self.eraser_level = 1     # committed finger count, 1..4
-        self._level_pending = 1
-        self._level_votes = 0
-        self.eraser_diam = float(self.eraser_size)  # eased diameter actually used
         self.bg_on = False                          # background switch (beige or background.png)
-        self.switch_progress = 0.0                  # 0..1 dwell progress on the switch (for the UI)
-        self._switch_since: Optional[float] = None
-        self._switch_armed = True                   # must leave the switch before it can flip again
-        self.cursor = OneEuroCursor(min_cutoff, beta)
-        self.previous: Optional[tuple[int, int]] = None
-        # Brush stroke in progress: filtered finger points, the smoothed points already
-        # turned into ink, and where that ink currently ends (see STROKE_SMOOTH_RADIUS).
-        self.stroke_raw: list[np.ndarray] = []
-        self.stroke_smooth: list[np.ndarray] = []
-        self.stroke_end: Optional[np.ndarray] = None
+        self.switch = Dwell(SWITCH_DWELL)           # BG switch (pinky held on it)
+        self.clear_button = Dwell(CLEAR_DWELL)      # Clear button (pinky held on it)
+        self.pens = [Pen(min_cutoff, beta), Pen(min_cutoff, beta)]  # up to two hands draw at once
         self.status, self.status_until = "Draw", 0.0
-        self.last_action = 0.0
 
     def set_status(self, text: str, seconds: float = 0.45) -> None:
         self.status, self.status_until = text, time.monotonic() + seconds
@@ -642,52 +723,51 @@ class Painter:
         x, y, bw, bh = cv2.boundingRect(self.mask)
         self.ink_box = None if bw == 0 or bh == 0 else (x, y, x + bw, y + bh)
 
-    # ---- history ----
-    # A state only stores the ink's bounding box, because everything outside it
-    # is empty. That is far cheaper than copying the whole 1280x720 canvas each
-    # time a stroke starts (which used to cause a visible hitch).
-    def _capture(self) -> tuple:
-        if self.ink_box is None:
-            return (None, None, None)
-        x0, y0, x1, y1 = self.ink_box
-        return (self.ink_box, self.canvas[y0:y1, x0:x1].copy(), self.mask[y0:y1, x0:x1].copy())
-
-    def _restore(self, state: tuple) -> None:
-        box, canvas_crop, mask_crop = state
-        self.canvas.fill(0)
-        self.mask.fill(0)
-        if box is not None:
-            x0, y0, x1, y1 = box
-            self.canvas[y0:y1, x0:x1] = canvas_crop
-            self.mask[y0:y1, x0:x1] = mask_crop
-        self.ink_box = box
-
-    def snapshot(self) -> None:
-        self.undo_stack.append(self._capture())
-        if len(self.undo_stack) > 30:
-            self.undo_stack.pop(0)
-        self.redo_stack.clear()
-
-    def undo(self) -> None:
-        if self.undo_stack:
-            self.redo_stack.append(self._capture())
-            self._restore(self.undo_stack.pop())
-            self.set_status("UNDO", 1.0)
-
-    def redo(self) -> None:
-        if self.redo_stack:
-            self.undo_stack.append(self._capture())
-            self._restore(self.redo_stack.pop())
-            self.set_status("REDO", 1.0)
-
     def clear(self) -> None:
-        self.snapshot()
         self.canvas.fill(0)
         self.mask.fill(0)
         self.ink_box = None
-        self.previous = None
-        self.tip = None
+        for pen in self.pens:  # strokes in progress restart from scratch
+            pen.stroke_raw, pen.stroke_smooth, pen.stroke_end = [], [], None
+            pen.previous = None
+            pen.cursor.reset()
         self.set_status("CLEAR", 1.0)
+
+    # ---- hands -> pens ----
+    def assign_pens(self, hands: list[Hand]) -> list[tuple[Pen, Hand]]:
+        """Match this detection's hands to pens by position, so each person keeps their
+        own stroke even though both may be labelled "Right". Pens without a hand end
+        their stroke; a hand that appears far from a pen's last spot starts fresh."""
+        jump = PEN_JUMP * self.w
+        centres = [(hand.pts[WRIST] + hand.pts[MIDDLE_MCP]) / 2 for hand in hands]
+
+        def cost(pen: Pen, centre: np.ndarray) -> float:
+            # Compare with where the hand is heading, so two hands that cross keep their pens.
+            return jump if pen.pos is None else min(distance(pen.pos + pen.vel, centre), 2 * jump)
+
+        # At most two hands and two pens: try both ways round, keep the cheaper one.
+        best, best_cost = None, float("inf")
+        for order in ((0, 1), (1, 0)):
+            pairs = list(zip(order, range(len(hands))))
+            total = sum(cost(self.pens[p], centres[i]) for p, i in pairs)
+            if total < best_cost:
+                best, best_cost = pairs, total
+        matched = []
+        used = set()
+        for p, i in best or []:
+            pen = self.pens[p]
+            if pen.pos is not None and distance(pen.pos + pen.vel, centres[i]) > jump:
+                self.end_stroke(pen)  # a different hand: do not join the two with a line
+                pen.pos = None
+            pen.vel = np.zeros(2) if pen.pos is None else 0.5 * pen.vel + 0.5 * (centres[i] - pen.pos)
+            pen.pos = centres[i]
+            matched.append((pen, hands[i]))
+            used.add(p)
+        for p, pen in enumerate(self.pens):
+            if p not in used:
+                self.end_stroke(pen)
+                pen.pos, pen.vel = None, np.zeros(2)
+        return matched
 
     # ---- tools ----
     @property
@@ -710,47 +790,29 @@ class Painter:
         self.bg_on = not self.bg_on
         self.set_status("BACKGROUND ON" if self.bg_on else "CAMERA BACKGROUND", 1.0)
 
-    def update_switch_hover(self, over: bool) -> None:
-        """Call once per frame. Flips the switch after the pinky rests on it for
-        SWITCH_DWELL seconds; it must then leave the switch before it can flip again,
-        so sweeping across the bar or hovering never makes it flicker."""
-        if not over:
-            self._switch_since, self._switch_armed, self.switch_progress = None, True, 0.0
-            return
-        if not self._switch_armed:
-            return
-        now = time.monotonic()
-        if self._switch_since is None:
-            self._switch_since = now
-        held = now - self._switch_since
-        self.switch_progress = min(1.0, held / SWITCH_DWELL)
-        if held >= SWITCH_DWELL:
-            self.toggle_bg()
-            self._switch_since, self._switch_armed, self.switch_progress = None, False, 0.0
-
-    def eraser_target(self, level: Optional[int] = None) -> float:
-        """Eraser diameter in px for a finger count (default: the committed one)."""
-        level = self.eraser_level if level is None else level
+    def eraser_target(self, level: int = 1) -> float:
+        """Eraser diameter in px for a raised-finger count."""
         return self.eraser_size * ERASER_SCALES[int(np.clip(level, 1, len(ERASER_SCALES))) - 1]
 
-    def observe_eraser_level(self, raised: int) -> int:
+    @staticmethod
+    def observe_eraser_level(pen: Pen, raised: int) -> int:
         """Feed this frame's raised-finger count; returns the committed level.
 
         A change only counts after LEVEL_CONFIRM_FRAMES identical frames, so a
         finger flickering for one frame does not make the eraser jump.
         """
         raised = int(np.clip(raised, 1, len(ERASER_SCALES)))
-        if raised == self.eraser_level:
-            self._level_votes = 0
-        elif raised == self._level_pending:
-            self._level_votes += 1
-            if self._level_votes >= LEVEL_CONFIRM_FRAMES:
-                self.eraser_level, self._level_votes = raised, 0
+        if raised == pen.eraser_level:
+            pen._level_votes = 0
+        elif raised == pen._level_pending:
+            pen._level_votes += 1
+            if pen._level_votes >= LEVEL_CONFIRM_FRAMES:
+                pen.eraser_level, pen._level_votes = raised, 0
         else:
-            self._level_pending, self._level_votes = raised, 1
+            pen._level_pending, pen._level_votes = raised, 1
             if LEVEL_CONFIRM_FRAMES <= 1:
-                self.eraser_level, self._level_votes = raised, 0
-        return self.eraser_level
+                pen.eraser_level, pen._level_votes = raised, 0
+        return pen.eraser_level
 
     def adjust_size(self, direction: int) -> None:
         """[ and ] keys: shrink/grow whichever tool is active."""
@@ -779,94 +841,97 @@ class Painter:
             self.set_status(f"Brush {self.brush}px", 0.8)
 
     # ---- smoothed brush strokes ----
-    def _smoothed(self, i: int) -> np.ndarray:
+    @staticmethod
+    def _smoothed(pen: Pen, i: int) -> np.ndarray:
         """Stroke point i averaged with its neighbours on both sides (fewer at the ends)."""
         r = STROKE_SMOOTH_RADIUS
-        lo, hi = max(0, i - r), min(len(self.stroke_raw), i + r + 1)
+        lo, hi = max(0, i - r), min(len(pen.stroke_raw), i + r + 1)
         weights = _STROKE_WEIGHTS[lo - i + r:hi - i + r]
-        return (np.asarray(self.stroke_raw[lo:hi]) * weights[:, None]).sum(axis=0) / weights.sum()
+        return (np.asarray(pen.stroke_raw[lo:hi]) * weights[:, None]).sum(axis=0) / weights.sum()
 
-    def _ink(self, points: np.ndarray) -> None:
+    def _ink(self, pen: Pen, points: np.ndarray) -> None:
         """Draw a polyline of float points into the canvas and mask (anti-aliased, subpixel)."""
         pts = subpixel(points)
-        cv2.polylines(self.canvas, [pts], False, self.color, self.brush, cv2.LINE_AA, SUBPIXEL_BITS)
-        cv2.polylines(self.mask, [pts], False, 255, self.brush, cv2.LINE_AA, SUBPIXEL_BITS)
+        cv2.polylines(self.canvas, [pts], False, pen.color, pen.width, cv2.LINE_AA, SUBPIXEL_BITS)
+        cv2.polylines(self.mask, [pts], False, 255, pen.width, cv2.LINE_AA, SUBPIXEL_BITS)
         lo, hi = points.min(axis=0), points.max(axis=0)
-        self._grow_box((int(lo[0]), int(lo[1])), (int(hi[0]) + 1, int(hi[1]) + 1), self.brush)
+        self._grow_box((int(lo[0]), int(lo[1])), (int(hi[0]) + 1, int(hi[1]) + 1), pen.width)
 
-    def _commit(self, point: np.ndarray) -> None:
+    def _commit(self, pen: Pen, point: np.ndarray) -> None:
         """Turn the next smoothed point into ink. The ink runs through the midpoints
         between smoothed points with quadratic curves, so it has no corners."""
-        self.stroke_smooth.append(point)
-        if len(self.stroke_smooth) == 1:
-            self.stroke_end = point
-            self._ink(np.array([point, point]))  # a tap still leaves a dot
+        pen.stroke_smooth.append(point)
+        if len(pen.stroke_smooth) == 1:
+            pen.stroke_end = point
+            self._ink(pen, np.array([point, point]))  # a tap still leaves a dot
             return
-        control = self.stroke_smooth[-2]
+        control = pen.stroke_smooth[-2]
         end = (control + point) / 2
-        self._ink(quad_curve(self.stroke_end, control, end))
-        self.stroke_end = end
+        self._ink(pen, quad_curve(pen.stroke_end, control, end))
+        pen.stroke_end = end
 
-    def _brush_step(self, point: np.ndarray) -> None:
-        self.stroke_raw.append(point)
+    def _brush_step(self, pen: Pen, point: np.ndarray) -> None:
+        pen.stroke_raw.append(point)
         # Point i is final once it has STROKE_SMOOTH_RADIUS newer neighbours.
-        while len(self.stroke_smooth) < len(self.stroke_raw) - STROKE_SMOOTH_RADIUS:
-            self._commit(self._smoothed(len(self.stroke_smooth)))
+        while len(pen.stroke_smooth) < len(pen.stroke_raw) - STROKE_SMOOTH_RADIUS:
+            self._commit(pen, self._smoothed(pen, len(pen.stroke_smooth)))
 
-    def _finish_brush_stroke(self) -> None:
+    def _finish_brush_stroke(self, pen: Pen) -> None:
         """Pen up: smooth the remaining points with what is known and ink them."""
-        while len(self.stroke_smooth) < len(self.stroke_raw):
-            self._commit(self._smoothed(len(self.stroke_smooth)))
-        if len(self.stroke_smooth) >= 2:
+        while len(pen.stroke_smooth) < len(pen.stroke_raw):
+            self._commit(pen, self._smoothed(pen, len(pen.stroke_smooth)))
+        if len(pen.stroke_smooth) >= 2:
             # Finish where the finger stopped: the last averages lean back into the stroke.
-            self._ink(quad_curve(self.stroke_end, self.stroke_smooth[-1], self.stroke_raw[-1]))
-        self.stroke_raw, self.stroke_smooth, self.stroke_end = [], [], None
+            self._ink(pen, quad_curve(pen.stroke_end, pen.stroke_smooth[-1], pen.stroke_raw[-1]))
+        pen.stroke_raw, pen.stroke_smooth, pen.stroke_end = [], [], None
 
     def draw_pending(self, frame: np.ndarray) -> None:
-        """Live preview of the not-yet-smoothed end of the stroke, from the end of the
+        """Live preview of the not-yet-smoothed end of each stroke, from the end of the
         ink to the finger, so the brush never lags behind (drawn on the frame only)."""
-        if self.stroke_end is None or len(self.stroke_raw) <= len(self.stroke_smooth):
-            return
-        tail = [self.stroke_end, self.stroke_smooth[-1]] + self.stroke_raw[len(self.stroke_smooth):]
-        cv2.polylines(frame, [subpixel(tail)], False, self.color, self.brush, cv2.LINE_AA, SUBPIXEL_BITS)
+        for pen in self.pens:
+            if pen.stroke_end is None or len(pen.stroke_raw) <= len(pen.stroke_smooth):
+                continue
+            tail = [pen.stroke_end, pen.stroke_smooth[-1]] + pen.stroke_raw[len(pen.stroke_smooth):]
+            cv2.polylines(frame, [subpixel(tail)], False, pen.color, pen.width, cv2.LINE_AA, SUBPIXEL_BITS)
 
     # ---- drawing ----
-    def draw(self, raw: np.ndarray) -> None:
-        """Extend the current stroke with the active tool (brush or eraser)."""
+    def draw(self, pen: Pen, raw: np.ndarray, eraser_level: int = 1) -> None:
+        """Extend the hand's current stroke with the active tool (brush or eraser)."""
         erase = self.erasing
-        p = self.cursor.update(raw, time.perf_counter())
+        p = pen.cursor.update(raw, time.perf_counter())
         current = (int(round(float(p[0]))), int(round(float(p[1]))))
-        if self.previous is None:
-            self.snapshot()
+        if pen.previous is None:
+            # The stroke keeps the color and width it starts with.
+            pen.color, pen.width = self.color, self.brush
             if erase:  # start the stroke at the right size instead of easing from a stale one
-                self.eraser_diam = self.eraser_target()
+                pen.eraser_diam = self.eraser_target(eraser_level)
         elif erase:
             # The eraser eases toward the size for the current finger count, so it
             # grows and shrinks smoothly instead of snapping.
-            target = self.eraser_target()
-            self.eraser_diam += (target - self.eraser_diam) * ERASER_EASING
-            if abs(target - self.eraser_diam) < 0.5:
-                self.eraser_diam = target
-            width = max(1, int(round(self.eraser_diam)))
+            target = self.eraser_target(eraser_level)
+            pen.eraser_diam += (target - pen.eraser_diam) * ERASER_EASING
+            if abs(target - pen.eraser_diam) < 0.5:
+                pen.eraser_diam = target
+            width = max(1, int(round(pen.eraser_diam)))
             # No anti-aliasing here: AA would leave partially-erased mask
             # pixels (a ghost outline) and costs more on a wide eraser.
-            cv2.line(self.canvas, self.previous, current, (0, 0, 0), width, cv2.LINE_8)
-            cv2.line(self.mask, self.previous, current, 0, width, cv2.LINE_8)
+            cv2.line(self.canvas, pen.previous, current, (0, 0, 0), width, cv2.LINE_8)
+            cv2.line(self.mask, pen.previous, current, 0, width, cv2.LINE_8)
             self._erased = True
         if not erase:  # the brush draws through the smoothing pipeline (also the first point)
-            self._brush_step(np.asarray(p, np.float64))
-        self.previous = current
-        self.tip = current
-        self.tip_radius = max(1, int(round(self.eraser_diam)) // 2) if erase else max(4, self.brush // 2 + 3)
+            self._brush_step(pen, np.asarray(p, np.float64))
+        pen.previous = current
+        pen.tip = current
+        pen.tip_radius = max(1, int(round(pen.eraser_diam)) // 2) if erase else max(4, pen.width // 2 + 3)
 
-    def end_stroke(self) -> None:
-        if self.stroke_raw:
-            self._finish_brush_stroke()
-        self.previous = None
-        self.tip = None
-        self.cursor.reset()
-        if self._erased:
-            # Shrink the ink box again after erasing (runs once per erase stroke).
+    def end_stroke(self, pen: Pen) -> None:
+        if pen.stroke_raw:
+            self._finish_brush_stroke(pen)
+        pen.previous = None
+        pen.tip = None
+        pen.cursor.reset()
+        if self._erased and not any(other.active for other in self.pens if other is not pen):
+            # Shrink the ink box again after erasing (once nobody is mid-stroke).
             self._erased = False
             self._recompute_box()
 
@@ -886,14 +951,14 @@ class Painter:
         self.draw_pending(frame)
 
 
-def eraser_step(painter: Painter, pts: np.ndarray) -> int:
+def eraser_step(painter: Painter, pen: Pen, pts: np.ndarray) -> int:
     """Erase for one frame. Size comes from the raised fingers (index is already up):
     index = smallest, +middle, +ring, +pinky = biggest. The eraser is centred on the
     raised fingertips, so it covers what your fingers point at. Returns the level."""
     raised = 1 + sum(finger_extended(pts, *f) for f in FINGERS[1:])
-    level = painter.observe_eraser_level(raised)
+    level = painter.observe_eraser_level(pen, raised)
     tips = np.asarray([pts[f[2]] for f in FINGERS[:level]], dtype=np.float32)
-    painter.draw(tips.mean(axis=0))
+    painter.draw(pen, tips.mean(axis=0), level)
     return level
 
 
@@ -927,22 +992,25 @@ def shade_box(img: np.ndarray, rect: tuple[int, int, int, int], radius: int, alp
 
 
 def text_box(img: np.ndarray, lines: list[tuple[str, tuple]], x: int, y: int,
-             layout: "Layout", scale: float, thickness: int, center: bool = False) -> int:
-    """Draw lines of (text, color) on a shadow box whose top edge is at ``y``.
-    ``x`` is the left edge, or the centre when ``center`` is set. Returns the box bottom."""
+             layout: "Layout", scale: float, thickness: int, center: bool = False,
+             from_bottom: bool = False) -> int:
+    """Draw lines of (text, color) on a shadow box whose top edge is at ``y`` (bottom
+    edge with ``from_bottom``). ``x`` is the left edge, or the centre when ``center``
+    is set; centred boxes also centre each line. Returns the opposite edge's y."""
     pad, gap = layout.px(10), layout.px(7)
     sizes = [cv2.getTextSize(text, FONT, scale, thickness) for text, _ in lines]
     box_w = max(tw for (tw, _), _ in sizes) + 2 * pad
     line_h = max(th + base for (_, th), base in sizes)
     box_h = len(lines) * line_h + (len(lines) - 1) * gap + 2 * pad
     x0 = x - box_w // 2 if center else x
-    shade_box(img, (x0, y, x0 + box_w, y + box_h), layout.px(8))
-    ty = y + pad
+    top = y - box_h if from_bottom else y
+    shade_box(img, (x0, top, x0 + box_w, top + box_h), layout.px(8))
+    ty = top + pad
     for (text, color), ((tw, th), _) in zip(lines, sizes):
         tx = x0 + (box_w - tw) // 2 if center else x0 + pad
         cv2.putText(img, text, (tx, ty + th), FONT, scale, color, thickness, cv2.LINE_AA)
         ty += line_h + gap
-    return y + box_h
+    return top if from_bottom else top + box_h
 
 
 def draw_switch(frame: np.ndarray, painter: Painter, layout: Layout) -> None:
@@ -960,13 +1028,31 @@ def draw_switch(frame: np.ndarray, painter: Painter, layout: Layout) -> None:
     (tw, _), _ = cv2.getTextSize("BG", FONT, layout.font(0.6), px(1))
     cv2.putText(frame, "BG", (cx - tw // 2, label_y), FONT, layout.font(0.6), (235, 235, 235),
                 px(1), cv2.LINE_AA)
-    if painter.switch_progress > 0:  # dwell progress bar under the label
+    if painter.switch.progress > 0:  # dwell progress bar under the label
         half = px(PANEL_W) // 2 - px(14)
-        end = cx - half + int(2 * half * painter.switch_progress)
+        end = cx - half + int(2 * half * painter.switch.progress)
         cv2.line(frame, (cx - half, label_y + px(12)), (end, label_y + px(12)), (255, 255, 255), px(4))
 
 
-def draw_ui(frame: np.ndarray, painter: Painter, layout: Layout, stats: PerfStats, show_stats: bool) -> None:
+def draw_clear_button(frame: np.ndarray, painter: Painter, layout: Layout) -> None:
+    """Clear button (bottom of the right panel); fills up while the pinky is held on it."""
+    px = layout.px
+    cx, cy = layout.panel_x, layout.clear_y
+    half_w, half_h = px(PANEL_W) // 2 - px(12), px(CLEAR_HALF_H)
+    x0, y0, x1, y1 = cx - half_w, cy - half_h, cx + half_w, cy + half_h
+    cv2.rectangle(frame, (x0, y0), (x1, y1), (60, 60, 150), -1)
+    if painter.clear_button.progress > 0:
+        fill_x = x0 + int((x1 - x0) * painter.clear_button.progress)
+        cv2.rectangle(frame, (x0, y0), (fill_x, y1), (60, 60, 230), -1)
+    cv2.rectangle(frame, (x0, y0), (x1, y1), (200, 200, 230), px(1), cv2.LINE_AA)
+    label = "HOLD" if painter.clear_button.progress > 0 else "CLEAR"
+    (tw, th), _ = cv2.getTextSize(label, FONT, layout.font(0.6), px(2))
+    cv2.putText(frame, label, (cx - tw // 2, cy + th // 2), FONT, layout.font(0.6), (255, 255, 255),
+                px(2), cv2.LINE_AA)
+
+
+def draw_ui(frame: np.ndarray, painter: Painter, layout: Layout, stats: PerfStats, show_stats: bool,
+            warnings: list[str]) -> None:
     h, w = frame.shape[:2]
     px = layout.px
 
@@ -993,6 +1079,7 @@ def draw_ui(frame: np.ndarray, painter: Painter, layout: Layout, stats: PerfStat
     px0, py0, px1, py1 = layout.panel_rect
     cv2.rectangle(frame, (px0, py0), (px1, py1), (25, 25, 25), -1)
     draw_switch(frame, painter, layout)
+    draw_clear_button(frame, painter, layout)
     sx, sy0, sy1, sw = layout.panel_x, layout.slider_y0, layout.slider_y1, px(SLIDER_HALF_W)
     cv2.rectangle(frame, (sx - sw, sy0), (sx + sw, sy1), (75, 75, 75), -1)
     ky = layout.slider_y(painter.size_fraction())
@@ -1001,7 +1088,7 @@ def draw_ui(frame: np.ndarray, painter: Painter, layout: Layout, stats: PerfStat
     cv2.circle(frame, (sx, ky), px(KNOB_R), (245, 245, 245), -1, cv2.LINE_AA)
     cv2.circle(frame, (sx, ky), px(KNOB_R), (60, 60, 60), px(1), cv2.LINE_AA)
     if painter.erasing:
-        lines = [f"Eraser {painter.eraser_level}/{len(ERASER_SCALES)}", f"{painter.eraser_target():.0f}px"]
+        lines = ["Eraser", f"{painter.eraser_target(1):.0f}-{painter.eraser_target(len(ERASER_SCALES)):.0f}px"]
     else:
         lines = ["Brush", f"{painter.brush}px"]
     ty = sy1 + px(KNOB_R) + px(20)
@@ -1011,22 +1098,28 @@ def draw_ui(frame: np.ndarray, painter: Painter, layout: Layout, stats: PerfStat
         ty += px(20)
 
     # ---- status line, top centre (on a shadow box) ----
-    idle = ("Erase: index up, more fingers = bigger | Pinky on panels: tools, size & BG" if painter.erasing
-            else "Draw: index finger | Pinky on panels: colors, eraser, size & BG")
+    idle = ("Erase: index up, more fingers = bigger | Pinky on panels: tools, size, BG & clear"
+            if painter.erasing else "Draw: index finger | Pinky on panels: colors, eraser, size, BG & clear")
     text = painter.status if time.monotonic() < painter.status_until else idle
-    bottom = text_box(frame, [(text, (255, 255, 255))], w // 2, px(14), layout,
-                      layout.font(0.62), px(2), center=True)
+    text_box(frame, [(text, (255, 255, 255))], w // 2, px(14), layout,
+             layout.font(0.62), px(2), center=True)
 
-    # ---- stats, top left beside the color column (on a shadow box) ----
+    # ---- stats, bottom centre (on a shadow box, lines centred) ----
+    above = h - px(14)  # warnings go above the stats box
     if show_stats:
         fps_color = (80, 255, 80) if stats.fps >= 24 else (0, 200, 255) if stats.fps >= 15 else (60, 60, 255)
         white = (255, 255, 255)
-        text_box(frame, [
-            (f"FPS: {stats.fps:5.1f}", fps_color),
-            (f"Frame: {stats.frametime:5.1f} ms (worst {stats.worst:.0f})", white),
-            (f"Detect: {stats.infer:5.1f} ms ({stats.detect_fps:.0f}/s)", white),
-            (f"Paint: {stats.paint:5.1f} ms", white),
-        ], layout.col_rect[2] + px(14), bottom + px(12), layout, layout.font(0.55), px(1))
+        above = text_box(frame, [
+            (f"FPS: {stats.fps:.1f}", fps_color),
+            (f"Frame: {stats.frametime:.1f} ms (worst {stats.worst:.0f})", white),
+            (f"Detect: {stats.infer:.1f} ms ({stats.detect_fps:.0f}/s)", white),
+            (f"Paint: {stats.paint:.1f} ms", white),
+        ], w // 2, above, layout, layout.font(0.55), px(1), center=True, from_bottom=True) - px(10)
+
+    # ---- warnings (camera lost, too dark), bottom centre above the stats ----
+    if warnings:
+        lines = [(text, (0, 200, 255)) for text in warnings]
+        text_box(frame, lines, w // 2, above, layout, layout.font(0.7), px(2), center=True, from_bottom=True)
 
 
 # --------------------------------------------------------------------------
@@ -1063,18 +1156,11 @@ def main() -> None:
     # bursts and starve the detector process; 2 threads measured fastest overall.
     cv2.setNumThreads(2)
 
-    cap = cv2.VideoCapture(args.camera)
-    if not cap.isOpened():
-        raise RuntimeError("Cannot open camera")
-    # MJPG usually unlocks 30 fps at 1080p (raw YUYV at 1080p is often capped at 5 fps).
-    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, args.width)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, args.height)
-    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-    ok, first = cap.read()
-    if not ok:
-        raise RuntimeError("Cannot read camera")
-    cam_h, cam_w = first.shape[:2]
+    cap = open_camera(args.camera, args.width, args.height)
+    if cap is None:
+        raise RuntimeError(f"Cannot open camera {args.camera}")
+    cam_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    cam_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     w, h = args.width, args.height
     # If the camera delivers a different size, every frame is resized to the preview size.
     resized = (cam_w, cam_h) != (w, h)
@@ -1098,25 +1184,32 @@ def main() -> None:
     cv2.namedWindow(window_title, cv2.WINDOW_NORMAL | cv2.WINDOW_GUI_NORMAL)
     initial_w = min(1600, max(960, w))
     cv2.resizeWindow(window_title, initial_w, max(540, round(initial_w * h / w)))
-    cam = CameraStream(cap, (w, h))
-    # Per-side transition state prevents repeated undo/redo while a hand stays closed.
-    action_armed = {"Left": True, "Right": True}
+    cam = CameraStream(cap, (w, h), lambda: open_camera(args.camera, w, h))
     # Page shown instead of the camera when the switch is on (background.png or beige).
     bg_img, bg_light = load_background(w, h)
     try:
         with HandTracker(cam, args.model, acceleration, (det_w, det_h), w, h) as tracker:
             frame_seq = det_seq = 0
-            hands: dict[str, Hand] = {}
-            over_switch = False
-            ui_point = None
+            hands: list[Hand] = []
+            ui_points: list[tuple[int, int]] = []
+            brightness = 128.0    # smoothed camera brightness, for the "too dark" warning
+            frame = None
             while True:
-                frame_seq, frame = cam.read(frame_seq)
+                frame_seq, new_frame = cam.read(frame_seq, timeout=0.25)
                 if tracker.error is not None:
                     raise tracker.error
-                if frame is None:
-                    if not cam.running:
+                if new_frame is None:
+                    if frame is None or cam.connected:
+                        continue
+                    # Camera lost: keep the window alive (and Q working) while it reconnects.
+                    view = cv2.resize(cv2.convertScaleAbs(frame, alpha=0.35), (view_w, view_h))
+                    draw_ui(view, painter, layout, stats, show_stats,
+                            ["Camera disconnected - reconnecting..."])
+                    cv2.imshow(window_title, view)
+                    if cv2.waitKey(30) & 0xFF in (ord("q"), 27):
                         break
                     continue
+                frame = new_frame
                 t1 = time.perf_counter()
 
                 # The UI lives in window pixels; rebuild it when the window is resized.
@@ -1132,66 +1225,47 @@ def main() -> None:
                 if seq != det_seq:
                     det_seq, hands = seq, latest_hands
                     stats.detection()
-                    over_switch = False  # pinky resting on the background switch this frame
-                    ui_point = None      # pinky position while it is on a panel (drawn as a ring)
-
-                    # Two-hand-only undo/redo. Require a short closed/open state before transition.
-                    if len(hands) == 2:
-                        closed_sides = [side for side, hand in hands.items() if hand.fist]
-                        # A single closing hand creates one action.  Two simultaneous fists
-                        # intentionally do nothing, avoiding ambiguous undo+redo sequences.
-                        if len(closed_sides) == 1:
-                            side = closed_sides[0]
-                            if action_armed[side] and time.monotonic() - painter.last_action > 0.55:
-                                (painter.undo if side == "Left" else painter.redo)()
-                                action_armed[side] = False
-                                painter.last_action = time.monotonic()
-                        for side, hand in hands.items():
-                            if not hand.fist:
-                                action_armed[side] = True
-                        painter.end_stroke()
-                    else:
-                        # Restore gesture arming when the other hand leaves view.
-                        for side in action_armed:
-                            if side not in hands or not hands[side].fist:
-                                action_armed[side] = True
-                        if hands:
-                            hand = next(iter(hands.values()))
-                            pts = hand.pts
-                            index = pts[INDEX_TIP]
-                            pinky = pts[PINKY_TIP] * view_f  # the panels are in window pixels
-                            # Panels only react when no stroke is running.
-                            zone = layout.hit(pinky) if painter.previous is None else None
-                            if hand.fist:
-                                # A single fist is just "pen up" now; fists only matter
-                                # for two-hand undo/redo.
-                                painter.end_stroke()
-                            elif zone is not None:
-                                # Pinky on a panel: colors/eraser (left column), BG switch or
-                                # size slider (bottom right). A stroke in progress is never
-                                # interrupted, so drawing near the panels stays safe.
-                                painter.end_stroke()
-                                ui_point = (int(pinky[0]), int(pinky[1]))
-                                kind, value = zone
-                                if kind == "switch":
-                                    over_switch = True
-                                elif kind == "slot":
-                                    painter.select_slot(value)
-                                elif kind == "size":
-                                    painter.set_size_fraction(value)
-                            elif finger_extended(pts, INDEX_MCP, INDEX_PIP, INDEX_TIP):
-                                # The active tool works exclusively while the index is extended.
-                                if painter.erasing:
-                                    level = eraser_step(painter, pts)
-                                    painter.set_status(f"ERASE {level}/{len(ERASER_SCALES)}")
-                                else:
-                                    painter.draw(index)
-                                    painter.set_status("DRAW: index extended")
+                    # Cheap brightness estimate on every 16th pixel, smoothed over ~1 s.
+                    brightness = 0.95 * brightness + 0.05 * float(frame[::16, ::16].mean())
+                    over_switch = over_clear = False
+                    ui_points = []  # pinky positions while on a panel (drawn as rings)
+                    # Every hand is its own pen, so two people can draw at once.
+                    for pen, hand in painter.assign_pens(hands):
+                        pts = hand.pts
+                        pinky = pts[PINKY_TIP] * view_f  # the panels are in window pixels
+                        # Panels only react when this hand is not mid-stroke.
+                        zone = layout.hit(pinky) if not pen.active else None
+                        if hand.fist:
+                            painter.end_stroke(pen)  # a fist is "pen up"
+                        elif zone is not None:
+                            # Pinky on a panel: colors/eraser (left column), BG switch,
+                            # size slider or Clear (right). A stroke in progress is never
+                            # interrupted, so drawing near the panels stays safe.
+                            painter.end_stroke(pen)
+                            ui_points.append((int(pinky[0]), int(pinky[1])))
+                            kind, value = zone
+                            if kind == "switch":
+                                over_switch = True
+                            elif kind == "clear":
+                                over_clear = True
+                            elif kind == "slot":
+                                painter.select_slot(value)
+                            elif kind == "size":
+                                painter.set_size_fraction(value)
+                        elif finger_extended(pts, INDEX_MCP, INDEX_PIP, INDEX_TIP):
+                            # The active tool works exclusively while the index is extended.
+                            if painter.erasing:
+                                level = eraser_step(painter, pen, pts)
+                                painter.set_status(f"ERASE {level}/{len(ERASER_SCALES)}")
                             else:
-                                painter.end_stroke()
+                                painter.draw(pen, pts[INDEX_TIP])
+                                painter.set_status("DRAW: index extended")
                         else:
-                            painter.end_stroke()
-                    painter.update_switch_hover(over_switch)
+                            painter.end_stroke(pen)
+                    if painter.switch.update(over_switch):
+                        painter.toggle_bg()
+                    if painter.clear_button.update(over_clear):
+                        painter.clear()
 
                 # ---- background + ink (on a private copy: the camera frame is shared
                 # with the detection thread, so it is never drawn on) ----
@@ -1202,13 +1276,15 @@ def main() -> None:
                 view = out if (view_w, view_h) == (w, h) else cv2.resize(
                     out, (view_w, view_h), interpolation=cv2.INTER_LINEAR)
                 # The skeleton, eraser radius and pen tip are drawn last, so paint never hides them.
-                for hand in hands.values():
+                for hand in hands:
                     draw_hand_landmarks(view, hand.pts * view_f, layout)
-                if painter.tip is not None:
-                    tip = (int(painter.tip[0] * view_f), int(painter.tip[1] * view_f))
-                    radius = max(1, int(painter.tip_radius * view_f))
-                    # Light rings disappear on a light page, so use dark ones there.
-                    dark_ring = painter.bg_on and bg_light
+                # Light rings disappear on a light page, so use dark ones there.
+                dark_ring = painter.bg_on and bg_light
+                for pen in painter.pens:
+                    if pen.tip is None:
+                        continue
+                    tip = (int(pen.tip[0] * view_f), int(pen.tip[1] * view_f))
+                    radius = max(1, int(pen.tip_radius * view_f))
                     if painter.erasing:  # eraser outline shows exactly what will be wiped
                         ring = (70, 70, 70) if dark_ring else (210, 210, 210)
                         cv2.circle(view, tip, radius, ring, layout.px(2), cv2.LINE_AA)
@@ -1218,10 +1294,11 @@ def main() -> None:
                 paint_ms = (time.perf_counter() - t1) * 1000.0
 
                 stats.tick(infer_ms, paint_ms)
-                draw_ui(view, painter, layout, stats, show_stats)
-                if ui_point is not None:  # show where the pinky is on the panels
-                    cv2.circle(view, ui_point, layout.px(10), (255, 255, 255), layout.px(2), cv2.LINE_AA)
-                    cv2.circle(view, ui_point, layout.px(12), (0, 0, 0), layout.px(1), cv2.LINE_AA)
+                warnings = ["Too dark - hand tracking needs more light"] if brightness < LOW_LIGHT else []
+                draw_ui(view, painter, layout, stats, show_stats, warnings)
+                for point in ui_points:  # show where each pinky is on the panels
+                    cv2.circle(view, point, layout.px(10), (255, 255, 255), layout.px(2), cv2.LINE_AA)
+                    cv2.circle(view, point, layout.px(12), (0, 0, 0), layout.px(1), cv2.LINE_AA)
                 cv2.imshow(window_title, view)
                 key = cv2.waitKey(1) & 0xFF
                 if key in (ord("q"), 27):
@@ -1246,9 +1323,66 @@ def main() -> None:
                     painter.set_status(f"SAVED {name}", 1.5)
     finally:
         cam.stop()
-        cap.release()
         cv2.destroyAllWindows()
 
 
+CRASH_LOG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "crash.log")
+
+
+def log_crash(text: str) -> None:
+    with open(CRASH_LOG, "a", encoding="utf-8") as log:
+        log.write(f"\n=== {time.strftime('%Y-%m-%d %H:%M:%S')} ===\n{text}\n")
+
+
+def run_app() -> None:
+    """Run the app once; Python errors are written to crash.log (and still raised),
+    native crashes (inside OpenCV/MediaPipe) via faulthandler."""
+    import faulthandler
+    import traceback
+    fault_log = open(CRASH_LOG, "a", encoding="utf-8")
+    faulthandler.enable(fault_log)
+    try:
+        main()
+    except KeyboardInterrupt:
+        pass
+    except BaseException:
+        log_crash(traceback.format_exc())
+        raise
+
+
+def supervise() -> None:
+    """Run the app in a child process and restart it when it crashes, so it keeps
+    running unattended. Quitting with Q/Esc ends it. Gives up after 5 crashes in a
+    minute (e.g. no camera plugged in), so a broken setup does not loop forever."""
+    import subprocess
+    command = [sys.executable, os.path.abspath(__file__), "--worker", *sys.argv[1:]]
+    crashes: list[float] = []
+    while True:
+        try:
+            code = subprocess.call(command)
+        except KeyboardInterrupt:
+            return
+        if code == 0:
+            return
+        now = time.monotonic()
+        crashes = [t for t in crashes if now - t < 60] + [now]
+        if len(crashes) >= 5:
+            log_crash(f"App exited with code {code}; 5 crashes within a minute, giving up.")
+            print("Crashed 5 times within a minute, giving up. See crash.log.")
+            return
+        log_crash(f"App exited with code {code}; restarting.")
+        print(f"App crashed (exit code {code}), restarting in 2 s. Details in crash.log")
+        time.sleep(2)
+
+
 if __name__ == "__main__":
-    main()
+    # Default: supervised (auto-restart). --worker is the supervised child;
+    # --no-restart runs the app directly, e.g. while developing.
+    if "--worker" in sys.argv:
+        sys.argv.remove("--worker")
+        run_app()
+    elif "--no-restart" in sys.argv:
+        sys.argv.remove("--no-restart")
+        run_app()
+    else:
+        supervise()
