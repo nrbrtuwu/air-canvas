@@ -1,51 +1,7 @@
-"""Hand-tracked drawing canvas with stable two-hand gestures.
+"""Hand-tracked drawing canvas with two-hand gestures (MediaPipe + OpenCV).
 
-Requirements: pip install opencv-python mediapipe numpy
-Place ``hand_landmarker.task`` next to this file (or pass --model PATH).
-Keys: S = save, C = clear, [ / ] = smaller/bigger brush or eraser,
-      F = toggle FPS/frametime overlay, Q/Esc = quit.
-
-Tools: hold your pinky over a color or the eraser in the column at the bottom
-left to select it. Slide your pinky along the slider at the bottom right to set the
-brush (or eraser) size. With the index finger extended, the active tool draws or erases.
-A single fist no longer erases; fists are only used for two-hand undo/redo
-(left fist = undo, right fist = redo).
-
-Background: the BG switch at the bottom right (hold your pinky on it for about 0.3 s, or
-press B) replaces the camera image with a beige page. Drawing, erasing, the hand
-skeleton and the toolbar all work exactly the same on top of it. With the switch on,
-S saves the drawing on the beige page instead of on black.
-
-Eraser size (v8): with the eraser selected, the number of raised fingers sets its
-size: index only = smallest, + middle = bigger, + ring = bigger, + pinky = biggest.
-The eraser is centred on the raised fingertips. [ and ] change the base size.
-
-What changed in v6 (drawing feel + drawing speed):
-  * Cursor smoothing is now a One Euro filter instead of a 10-frame median +
-    EMA + weighted trail. The old chain delayed the pen by roughly ten frames;
-    the One Euro filter is heavy only while your finger is nearly still (to
-    remove jitter) and almost lag-free as soon as you move.
-  * Compositing only touches the bounding box of the ink instead of blending
-    the whole 1280x720 frame on every frame once anything was drawn. That
-    full-frame blend was the reason FPS dropped as soon as you started drawing.
-  * Eraser strokes use non-antialiased lines: faster, and they no longer leave
-    a faint ghost outline in the mask.
-  * A small ring is drawn at the pen tip so you can see exactly where it is.
-  * The overlay also shows "Paint" time (everything after detection).
-
-What changed in v11:
-  * The preview is 1920x1080 by default (--width / --height). The hand detector
-    still runs on a 400 px wide copy (--detect-width), so tracking cost is unchanged.
-    If the camera cannot deliver 1080p, its frames are upscaled to the preview size.
-  * The MediaPipe GPU delegate is no longer attempted on Windows. The pip wheels
-    for Windows are built with GPU support disabled, so it always failed and fell
-    back to CPU. OpenCL is still used by OpenCV where it helps.
-  * MediaPipe/TFLite log noise is silenced (set KAMERA_VERBOSE=1 to see it again).
-
-Tuning:
-  --min-cutoff  lower = steadier when still, but more lag on slow strokes (default 1.0)
-  --beta        higher = less lag when moving fast, but more jitter (default 0.025)
-  INK_OPACITY   1.0 = solid paint (fastest); 0.88 = old look with 12% see-through
+Needs hand_landmarker.task next to this file (or --model PATH).
+Keys: S save, C clear, B background, [ / ] brush size, F FPS overlay, Q/Esc quit.
 """
 from __future__ import annotations
 
@@ -55,7 +11,6 @@ import os
 import sys
 import threading
 import time
-from collections import deque
 from typing import Optional
 
 # Quiet MediaPipe / TFLite startup warnings. Must be set before mediapipe is imported.
@@ -405,7 +360,6 @@ class Painter:
         self.previous: Optional[tuple[int, int]] = None
         self.status, self.status_until = "Draw", 0.0
         self.last_action = 0.0
-        self.shake_samples: deque = deque(maxlen=9)
 
     def set_status(self, text: str, seconds: float = 0.45) -> None:
         self.status, self.status_until = text, time.monotonic() + seconds
@@ -619,16 +573,6 @@ class Painter:
         else:
             blended = cv2.addWeighted(dst, 1.0 - INK_OPACITY, src, INK_OPACITY, 0)
             cv2.copyTo(blended, m, dst)
-
-    def maybe_shake_clear(self, raw: np.ndarray) -> None:
-        self.shake_samples.append(raw)
-        if len(self.shake_samples) == self.shake_samples.maxlen:
-            xs = np.asarray(self.shake_samples)[:, 0]
-            changes = np.count_nonzero(np.diff(np.sign(np.diff(xs))))
-            span = xs.max() - xs.min()
-            if changes >= 4 and span > 180:
-                self.clear()
-                self.shake_samples.clear()
 
 
 def eraser_step(painter: Painter, pts: np.ndarray) -> int:
@@ -871,13 +815,11 @@ def main() -> None:
                             # A single fist is just "pen up" now; fists only matter
                             # for two-hand undo/redo.
                             painter.end_stroke()
-                            painter.shake_samples.clear()
                         elif zone is not None:
                             # Pinky on a panel: colors/eraser (left column), BG switch or
                             # size slider (bottom right). A stroke in progress is never
                             # interrupted, so drawing near the panels stays safe.
                             painter.end_stroke()
-                            painter.shake_samples.clear()
                             ui_point = (int(pinky[0]), int(pinky[1]))
                             kind, value = zone
                             if kind == "switch":
@@ -893,14 +835,11 @@ def main() -> None:
                                 painter.set_status(f"ERASE {level}/{len(ERASER_SCALES)}")
                             else:
                                 painter.draw(index)
-                                painter.maybe_shake_clear(index)
                                 painter.set_status("DRAW: index extended")
                         else:
                             painter.end_stroke()
-                            painter.shake_samples.clear()
                     else:
                         painter.end_stroke()
-                        painter.shake_samples.clear()
 
                 painter.update_switch_hover(over_switch)
 
