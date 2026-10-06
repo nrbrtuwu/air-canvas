@@ -56,12 +56,27 @@ COLUMN_X = 45                  # horizontal centre of the color column (bottom l
 PANEL_W, PANEL_H = 520, 80     # bottom-right panel: BG switch + size slider
 SLOT_HIT = 25                  # pinky must be this close (px) to a color/eraser button
 # All UI sizes above are in screen pixels on a 1080p monitor. They are scaled to the
-# monitor resolution and to how big the frame is shown, not to the preview resolution.
+# monitor resolution, not to the preview resolution. The UI is drawn after the frame
+# has been resized to the window, so it is never stretched (and never pixelated).
 UI_REFERENCE_HEIGHT = 1080
 
 
+def enable_dpi_awareness() -> None:
+    """Stop Windows from bitmap-stretching the window on scaled (125%/150%) displays."""
+    if sys.platform != "win32":
+        return
+    import ctypes
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)  # per-monitor aware
+    except (AttributeError, OSError):
+        try:
+            ctypes.windll.user32.SetProcessDPIAware()
+        except (AttributeError, OSError):
+            pass
+
+
 def screen_height() -> int:
-    """Height of the primary monitor (same pixel units as the OpenCV window)."""
+    """Height of the primary monitor in pixels."""
     if sys.platform == "win32":
         try:
             import ctypes
@@ -71,17 +86,23 @@ def screen_height() -> int:
     return UI_REFERENCE_HEIGHT
 
 
-def ui_scale(window: str, w: int, h: int, screen_h: int) -> float:
-    """Frame pixels per UI pixel, so the controls keep the same size on the monitor
-    whatever the preview resolution or window size is."""
+def display_size(window: str, w: int, h: int) -> tuple[int, int]:
+    """Largest size with the frame's aspect ratio that fits the window's image area."""
     try:
         _, _, dw, dh = cv2.getWindowImageRect(window)
     except cv2.error:
         dw = dh = 0
-    shown = min(dw / w, dh / h) if dw > 0 and dh > 0 else 1.0  # frame -> screen factor
-    s = screen_h / UI_REFERENCE_HEIGHT / shown
-    # Keep the color column inside the frame when the window is very small.
-    return float(np.clip(s, 0.5, (h - 60) / 640))
+    if dw <= 0 or dh <= 0:
+        return w, h
+    f = min(dw / w, dh / h)
+    return max(1, round(w * f)), max(1, round(h * f))
+
+
+def ui_scale(screen_h: int, view_h: int) -> float:
+    """Display pixels per UI pixel. Follows the monitor resolution; only shrinks when
+    the window is too short for the status line, stats box and color column together
+    (about 840 UI pixels)."""
+    return float(np.clip(screen_h / UI_REFERENCE_HEIGHT, 0.5, max(0.5, view_h / 840)))
 
 
 class Layout:
@@ -806,8 +827,10 @@ def main() -> None:
         det_w, det_h = w, h
 
     painter = Painter(w, h, args.min_cutoff, args.beta)
+    enable_dpi_awareness()  # before the window exists, so sizes are real screen pixels
     screen_h = screen_height()
-    layout = Layout(w, h)
+    view_w, view_h, view_f = w, h, 1.0  # size the frame is shown at, and frame -> view factor
+    layout = Layout(w, h, ui_scale(screen_h, h))
     stats = PerfStats()
     show_stats = True
     window_title = "Hand Paint - S save | C clear | B background | [ ] size | F stats | Q quit"
@@ -872,10 +895,12 @@ def main() -> None:
                     pts = hand_points(lm, w, h)
                     hands[label] = Hand(label, pts, is_fist(pts))  # fist computed once
 
-                # Rebuild the UI when the window is resized, so it keeps its size on screen.
-                s_now = ui_scale(window_title, w, h, screen_h)
-                if abs(s_now - layout.s) > 0.02 * layout.s:
-                    layout = Layout(w, h, s_now)
+                # The UI lives in window pixels; rebuild it when the window is resized.
+                size = display_size(window_title, w, h)
+                if size != (view_w, view_h):
+                    view_w, view_h = size
+                    view_f = view_w / w
+                    layout = Layout(view_w, view_h, ui_scale(screen_h, view_h))
 
                 over_switch = False  # pinky resting on the background switch this frame
                 ui_point = None      # pinky position while it is on a panel (drawn as a ring)
@@ -904,7 +929,7 @@ def main() -> None:
                         hand = next(iter(hands.values()))
                         pts = hand.pts
                         index = pts[INDEX_TIP]
-                        pinky = pts[PINKY_TIP]
+                        pinky = pts[PINKY_TIP] * view_f  # the panels are in window pixels
                         # Panels only react when no stroke is running.
                         zone = layout.hit(pinky) if painter.previous is None else None
                         if hand.fist:
@@ -947,25 +972,30 @@ def main() -> None:
                 # ---- compositing: only the ink's bounding box is touched ----
                 # The frame is not needed afterwards, so draw on it directly (no copy).
                 painter.composite(frame)
+                # Resize to the window now, so everything drawn below is sharp on screen.
+                view = frame if (view_w, view_h) == (w, h) else cv2.resize(
+                    frame, (view_w, view_h), interpolation=cv2.INTER_LINEAR)
                 # The skeleton, eraser radius and pen tip are drawn last, so paint never hides them.
                 for hand in hands.values():
-                    draw_hand_landmarks(frame, hand.pts, layout)
+                    draw_hand_landmarks(view, hand.pts * view_f, layout)
                 if painter.tip is not None:
+                    tip = (int(painter.tip[0] * view_f), int(painter.tip[1] * view_f))
+                    radius = max(1, int(painter.tip_radius * view_f))
                     # Light rings disappear on beige, so use dark ones there.
                     if painter.erasing:  # eraser outline shows exactly what will be wiped
                         ring = (70, 70, 70) if painter.bg_on else (210, 210, 210)
-                        cv2.circle(frame, painter.tip, painter.tip_radius, ring, 2, cv2.LINE_AA)
+                        cv2.circle(view, tip, radius, ring, layout.px(2), cv2.LINE_AA)
                     else:
                         ring = (50, 50, 50) if painter.bg_on else (255, 255, 255)
-                        cv2.circle(frame, painter.tip, painter.tip_radius, ring, 1, cv2.LINE_AA)
+                        cv2.circle(view, tip, radius, ring, layout.px(1), cv2.LINE_AA)
                 paint_ms = (time.perf_counter() - t1) * 1000.0
 
                 stats.tick(infer_ms, paint_ms)
-                draw_ui(frame, painter, layout, stats, show_stats)
+                draw_ui(view, painter, layout, stats, show_stats)
                 if ui_point is not None:  # show where the pinky is on the panels
-                    cv2.circle(frame, ui_point, layout.px(10), (255, 255, 255), layout.px(2), cv2.LINE_AA)
-                    cv2.circle(frame, ui_point, layout.px(12), (0, 0, 0), layout.px(1), cv2.LINE_AA)
-                cv2.imshow(window_title, frame)
+                    cv2.circle(view, ui_point, layout.px(10), (255, 255, 255), layout.px(2), cv2.LINE_AA)
+                    cv2.circle(view, ui_point, layout.px(12), (0, 0, 0), layout.px(1), cv2.LINE_AA)
+                cv2.imshow(window_title, view)
                 key = cv2.waitKey(1) & 0xFF
                 if key in (ord("q"), 27):
                     break
