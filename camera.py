@@ -383,8 +383,17 @@ def ask_camera() -> Optional[int]:
             answer = "1"
         if answer.isdigit() and 1 <= int(answer) <= len(cameras):
             index, name = cameras[int(answer) - 1]
-            print(f"Using {name}.")
-            return index
+            # Listed is not the same as usable: a virtual camera (OBS) that is not
+            # started, or a camera another app holds, cannot deliver frames.
+            cap = cv2.VideoCapture(index)
+            works = cap.isOpened() and cap.read()[0]
+            cap.release()
+            if works:
+                print(f"Using {name}.")
+                return index
+            print(f"{name} could not be opened. If it is a virtual camera (e.g. OBS), "
+                  f"start it first, or pick another one.")
+            continue
         print(f"Please enter a number from 1 to {len(cameras)}.")
 
 
@@ -1289,7 +1298,10 @@ def main() -> None:
 
     cap = open_camera(args.camera, args.width, args.height)
     if cap is None:
-        raise RuntimeError(f"Cannot open camera {args.camera}")
+        # Restarting would not help, so tell the supervisor to stop (see supervise()).
+        print(f"Cannot open camera {args.camera}. If it is a virtual camera (e.g. OBS), "
+              f"start it first; otherwise check that no other app is using it.")
+        sys.exit(EXIT_NO_CAMERA)
     cam_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     cam_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     w, h = args.width, args.height
@@ -1459,6 +1471,7 @@ def main() -> None:
 
 
 CRASH_LOG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "crash.log")
+EXIT_NO_CAMERA = 3   # the chosen camera cannot be opened: not a crash, don't restart
 
 
 def log_crash(text: str) -> None:
@@ -1477,6 +1490,8 @@ def run_app() -> None:
         main()
     except KeyboardInterrupt:
         pass
+    except SystemExit:
+        raise
     except BaseException:
         log_crash(traceback.format_exc())
         raise
@@ -1494,7 +1509,7 @@ def supervise() -> None:
             code = subprocess.call(command)
         except KeyboardInterrupt:
             return
-        if code == 0:
+        if code in (0, EXIT_NO_CAMERA):
             return
         now = time.monotonic()
         crashes = [t for t in crashes if now - t < 60] + [now]
