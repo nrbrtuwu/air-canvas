@@ -44,7 +44,8 @@ Put `background.png` (or `.jpg` / `.jpeg`) next to `camera.py` and restart. It r
 |---|---|---|
 | `--camera N` | asked at start | Which camera to use. Without it, the app lists the cameras by name every time it starts and asks in the terminal |
 | `--width`, `--height` | `1920`, `1080` | Preview / canvas size (try `1280 720` on slow machines) |
-| `--detectors N` | `3` on 8+ cores | Hand detector processes working on alternate frames. Each detection uses one core, so more = more detections per second |
+| `--engine auto\|npu\|mediapipe` | `auto` | Hand detection engine. `auto` uses the Snapdragon NPU when available (Windows on ARM setup), otherwise MediaPipe |
+| `--detectors N` | `1` on the NPU, else `3` on 8+ cores | Hand detector processes working on alternate frames. Each detection uses one core, so more = more detections per second |
 | `--hands 1\|2` | `2` | Hands to track. `1` (drawing alone) roughly halves detection time, so the pen lags less |
 | `--gpu auto\|on\|off` | `auto` | GPU acceleration (MediaPipe GPU works on Linux only) |
 | `--no-restart` | | Don't auto-restart after a crash (for development) |
@@ -69,6 +70,10 @@ py -3.12-arm64 -m venv .venv-arm64
 ```
 
 pip warns that mediapipe needs `opencv-contrib-python`. That's expected: the OpenCV built by the script replaces it.
+
+### NPU hand detection
+
+On Snapdragon, hand detection runs on the NPU by default (`--engine auto`): the same MediaPipe palm and landmark models, as ONNX files in `models/`, through ONNX Runtime's Qualcomm plugin (`npu_hands.py` reproduces MediaPipe's pipeline around them). Detection takes ~5 ms instead of ~25-45 ms on a CPU core, and its points stay within ~1 px of MediaPipe's. The first start takes a few seconds while the models are compiled for the NPU. `--engine mediapipe` switches back.
 
 Virtual cameras that only ship an x64 driver (e.g. OBS Virtual Camera) show up in the list but can't be opened from ARM64. Use a real webcam, or the x64 setup for those.
 

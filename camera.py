@@ -447,12 +447,30 @@ class CameraStream:
             self.cap.release()
 
 
-def detector_process(conn, model_path: str, use_gpu: bool, num_hands: int = 2) -> None:
-    """Child process: runs MediaPipe hand detection. It lives in its own process
+def detector_process(conn, model_path: str, use_gpu: bool, num_hands: int = 2,
+                     engine: str = "mediapipe") -> None:
+    """Child process: runs hand detection. It lives in its own process
     because MediaPipe needs the GIL to hand work between its threads, and sharing
     the GIL with the display loop made detection several times slower.
     While fewer than num_hands are tracked, MediaPipe re-runs palm detection on every
-    frame to look for the missing one, so num_hands=1 roughly halves detection time."""
+    frame to look for the missing one, so num_hands=1 roughly halves detection time.
+    engine "npu" runs the same models through npu_hands on a Qualcomm NPU instead."""
+    if engine == "npu":
+        try:
+            import npu_hands
+            landmarker = npu_hands.NpuHandLandmarker(*npu_hands.default_models(), num_hands=num_hands)
+        except BaseException as error:
+            conn.send(("error", repr(error)))
+            return
+        conn.send(("ready", f"NPU pipeline ({landmarker.description})"))
+        while True:
+            message = conn.recv()
+            if message is None:
+                break
+            conn.send(("hands", [(label, pts.astype(np.float32))
+                                 for label, pts in landmarker.detect(message[1])]))
+        return
+
     def create(delegate):
         options = vision.HandLandmarkerOptions(
             base_options=python.BaseOptions(model_asset_path=model_path, delegate=delegate),
@@ -508,7 +526,8 @@ class HandTracker:
     has taken, and only results for frames newer than the last shown are kept."""
 
     def __init__(self, cam: CameraStream, model_path: str, acceleration: "Acceleration",
-                 det_size: tuple[int, int], w: int, h: int, detectors: int = 1, num_hands: int = 2):
+                 det_size: tuple[int, int], w: int, h: int, detectors: int = 1, num_hands: int = 2,
+                 engine: str = "mediapipe"):
         self.cam, self.acceleration = cam, acceleration
         self.det_size, self.scale = det_size, np.array([w, h], np.float32)
         self.lock = threading.Lock()
@@ -523,7 +542,7 @@ class HandTracker:
         for _ in range(max(1, detectors)):
             conn, child_conn = mp_process.Pipe()
             process = mp_process.Process(target=detector_process, daemon=True,
-                                         args=(child_conn, model_path, use_gpu, num_hands))
+                                         args=(child_conn, model_path, use_gpu, num_hands, engine))
             process.start()
             self.workers.append((conn, process))
         for conn, _ in self.workers:      # wait until every model is loaded
@@ -531,7 +550,7 @@ class HandTracker:
             if kind == "error":
                 self.stop_processes()
                 raise RuntimeError(f"Hand detector failed to start: {detail}")
-        print(f"MediaPipe: {detail}, {len(self.workers)} detector process(es)")
+        print(f"Hand detection: {detail}, {len(self.workers)} detector process(es)")
         self.running = True
         self.threads = [threading.Thread(target=self._run, args=(conn,), daemon=True)
                         for conn, _ in self.workers]
@@ -1228,9 +1247,13 @@ def main() -> None:
     ap.add_argument("--height", type=int, default=1080, help="preview / canvas height")
     ap.add_argument("--detect-width", type=int, default=400,
                     help="width of the image given to the hand detector (0 = full size). Lower = faster.")
-    ap.add_argument("--detectors", type=int, default=default_detectors(),
+    ap.add_argument("--engine", choices=("auto", "npu", "mediapipe"), default="auto",
+                    help="hand detection engine: npu runs MediaPipe's models on a Qualcomm NPU "
+                         "(Snapdragon, ~10x faster); auto uses it when available, else mediapipe.")
+    ap.add_argument("--detectors", type=int, default=None,
                     help="hand detector processes working on alternate frames. More = more "
-                         "detections per second on many-core CPUs (default: by core count).")
+                         "detections per second on many-core CPUs (default: 1 on the NPU, "
+                         "else by core count).")
     ap.add_argument("--hands", type=int, choices=(1, 2), default=2,
                     help="hands to track. 1 = one person drawing alone, about twice as fast "
                          "detection; 2 = two hands / two people.")
@@ -1244,6 +1267,13 @@ def main() -> None:
     args = ap.parse_args()
     if not os.path.isfile(args.model):
         raise FileNotFoundError(f"Hand model not found: {args.model}")
+    engine = args.engine
+    if engine == "auto":
+        import npu_hands
+        engine = "npu" if npu_hands.available() else "mediapipe"
+    if args.detectors is None:
+        # One NPU detector keeps up with 60 fps; more would only queue on the NPU.
+        args.detectors = 1 if engine == "npu" else default_detectors()
 
     acceleration = Acceleration(args.gpu)
     backends = []
@@ -1290,7 +1320,7 @@ def main() -> None:
     bg_img, bg_light = load_background(w, h)
     try:
         with HandTracker(cam, args.model, acceleration, (det_w, det_h), w, h,
-                         args.detectors, args.hands) as tracker:
+                         args.detectors, args.hands, engine) as tracker:
             frame_seq = det_seq = 0
             hands: list[Hand] = []
             ui_points: list[tuple[int, int]] = []

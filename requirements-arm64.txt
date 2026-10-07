@@ -6,6 +6,8 @@
 --no-binary cv2_enumerate_cameras
 numpy
 cv2_enumerate_cameras
+# NPU hand detection (npu_hands.py, --engine npu): ONNX Runtime + Qualcomm QNN plugin.
+onnxruntime-qnn
 absl-py~=2.3
 certifi
 sounddevice~=0.5
