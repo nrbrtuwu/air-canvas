@@ -68,6 +68,8 @@ py -3.12-arm64 -m venv .venv-arm64
 
 pip warns that mediapipe needs `opencv-contrib-python`. That's expected: the OpenCV built by the script replaces it.
 
+Virtual cameras that only ship an x64 driver (e.g. OBS Virtual Camera) show up in the list but can't be opened from ARM64. Use a real webcam, or the x64 setup for those.
+
 
 ## Disclaimer
 
