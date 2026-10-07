@@ -44,7 +44,7 @@ Put `background.png` (or `.jpg` / `.jpeg`) next to `camera.py` and restart. It r
 |---|---|---|
 | `--camera N` | asked at start | Which camera to use. Without it, the app lists the cameras by name every time it starts and asks in the terminal |
 | `--width`, `--height` | `1920`, `1080` | Preview / canvas size (try `1280 720` on slow machines) |
-| `--engine auto\|npu\|mediapipe` | `auto` | Hand detection engine (beta). `auto` uses the Snapdragon NPU when available (Windows on ARM setup), otherwise MediaPipe. `npu` also tries an Intel NPU |
+| `--engine auto\|npu\|mediapipe` | `auto` | Hand detection engine (beta). `auto` uses an NPU when one is set up (see [NPU hand detection](#npu-hand-detection-beta)), otherwise MediaPipe |
 | `--detectors N` | `1` on the NPU, else `3` on 8+ cores | Hand detector processes working on alternate frames. Each detection uses one core, so more = more detections per second |
 | `--hands 1\|2` | `2` | Hands to track. `1` (drawing alone) roughly halves detection time, so the pen lags less |
 | `--gpu auto\|on\|off` | `auto` | GPU acceleration (MediaPipe GPU works on Linux only) |
@@ -57,9 +57,39 @@ By default the app restarts itself after a crash and writes the error to `crash.
 - If the window doesn't open (Wayland): `QT_QPA_PLATFORM=xcb python camera.py`
 - `sudo apt install python3-tk` lets the UI detect your screen size (otherwise it assumes 1080p).
 
-## Windows on ARM (beta)
+## NPU hand detection (beta)
 
-Runs natively on ARM64 Python (e.g. Snapdragon X laptops) instead of x64 emulation. MediaPipe ships an ARM64 wheel, but OpenCV doesn't, so it is compiled once (15-30 min). Needs git, an ARM64 Python 3.12 from python.org, and Visual Studio 2022 Build Tools with **Desktop development with C++**, **MSVC ARM64 build tools** and a **Windows 11 SDK**.
+If your PC has an NPU (the AI chip in Intel Core Ultra and Snapdragon X processors), hand detection can run on it instead of the CPU. It's the same MediaPipe hand models (ONNX copies in `models/`), so tracking quality stays the same, but it's much faster and leaves the CPU free:
+
+| | Detect time in the app |
+|---|---|
+| MediaPipe on the CPU (default without an NPU) | ~25-45 ms |
+| Intel NPU (Core Ultra 5 245KF) | ~8-10 ms |
+| Qualcomm NPU (Snapdragon X Elite) | ~5 ms |
+
+Once set up, `python camera.py` uses the NPU on its own. Check the terminal line at start:
+
+```
+Hand detection: NPU pipeline (Intel NPU (OpenVINO)), 1 detector process(es)
+```
+
+If it says `Hand detection: CPU, ...` instead, it's running MediaPipe. `--engine npu` forces the NPU (and tells you what's missing if it can't), `--engine mediapipe` switches back. The first start takes a few extra seconds while the models are compiled for the NPU.
+
+### Intel Core Ultra (x64 Windows)
+
+Needs **Python 3.11-3.13** (the Intel package doesn't support 3.14 yet; `py install 3.13` or `winget install Python.Python.3.13` adds it next to 3.14) and Intel's NPU driver (Task Manager > Performance should show **NPU**; it comes with Windows Update or Intel's driver page).
+
+```powershell
+py -3.13 -m venv .venv
+.venv\Scripts\pip install -r requirements.txt -r requirements-intel-npu.txt
+.venv\Scripts\python camera.py
+```
+
+Always start it with `.venv\Scripts\python` (or run `.venv\Scripts\Activate.ps1` first): plain `python` is your system Python, which doesn't have the NPU packages.
+
+### Snapdragon X (Windows on ARM)
+
+This runs natively on ARM64 Python instead of x64 emulation. MediaPipe ships an ARM64 wheel, but OpenCV doesn't, so it is compiled once (15-30 min). Needs git, an **ARM64 Python 3.12** from python.org, and Visual Studio 2022 Build Tools with **Desktop development with C++**, **MSVC ARM64 build tools** and a **Windows 11 SDK**.
 
 ```powershell
 py -3.12-arm64 -m venv .venv-arm64
@@ -69,19 +99,24 @@ py -3.12-arm64 -m venv .venv-arm64
 .venv-arm64\Scripts\python camera.py
 ```
 
-pip warns that mediapipe needs `opencv-contrib-python`. That's expected: the OpenCV built by the script replaces it.
+pip warns that mediapipe needs `opencv-contrib-python`. That's expected: the OpenCV built by the script replaces it. The NPU part (`onnxruntime-qnn`) is included in `requirements-arm64.txt`.
 
-### NPU hand detection (beta)
+**OBS Virtual Camera on ARM64:** it shows up in the camera list but only opens once OBS's ARM64 driver is registered instead of the x64 one. Close OBS, then in an **admin** terminal, from OBS's `data\obs-plugins\win-dshow` folder (the ARM64 file is in the ARM64 build of OBS):
 
-On Snapdragon, hand detection runs on the NPU by default (`--engine auto`): the same MediaPipe palm and landmark models, as ONNX files in `models/`, through ONNX Runtime's Qualcomm plugin (`npu_hands.py` reproduces MediaPipe's pipeline around them). Detection takes ~5 ms instead of ~25-45 ms on a CPU core, and its points stay within ~1 px of MediaPipe's. The first start takes a few seconds while the models are compiled for the NPU. `--engine mediapipe` switches back.
-
-**Intel Core Ultra NPUs (experimental, untested):** `pip install -r requirements-intel-npu.txt`, then `python camera.py --engine npu`. `auto` doesn't pick Intel NPUs yet, because a fast desktop CPU may beat them. To compare everything on your machine:
-
-```bash
-python scripts/bench_hands.py --camera 0
+```powershell
+regsvr32.exe /i /u obs-virtualcam-module64.dll
+regsvr32.exe /i obs-virtualcam-module-arm64.dll
 ```
 
-Virtual cameras that only ship an x64 driver (e.g. OBS Virtual Camera) show up in the list but can't be opened from ARM64. Use a real webcam, or the x64 setup for those.
+x64 apps can't use the OBS virtual camera while the ARM64 driver is registered ([OBS docs](https://obsproject.com/kb/windows-on-arm)).
+
+### Benchmark
+
+To see how every engine performs on your machine (hold a hand up for a real frame):
+
+```powershell
+.venv\Scripts\python scripts\bench_hands.py --camera 0
+```
 
 
 ## Disclaimer
