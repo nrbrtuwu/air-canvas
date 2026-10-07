@@ -65,7 +65,7 @@ If your PC has an NPU (the AI chip in Intel Core Ultra and Snapdragon X processo
 |---|---|
 | MediaPipe on the CPU (default without an NPU) | ~25-45 ms |
 | Intel NPU (Core Ultra 5 245KF) | ~8-10 ms |
-| Qualcomm NPU (Snapdragon X Elite) | ~5 ms |
+| Qualcomm NPU (Snapdragon X Elite X1E-78-100) | ~5 ms |
 
 Once set up, `python camera.py` uses the NPU on its own. Check the terminal line at start:
 
