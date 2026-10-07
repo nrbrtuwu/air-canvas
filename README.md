@@ -45,6 +45,7 @@ Put `background.png` (or `.jpg` / `.jpeg`) next to `camera.py` and restart. It r
 | `--camera N` | asked at start | Which camera to use. Without it, the app lists the cameras by name every time it starts and asks in the terminal |
 | `--width`, `--height` | `1920`, `1080` | Preview / canvas size (try `1280 720` on slow machines) |
 | `--detectors N` | `3` on 8+ cores | Hand detector processes working on alternate frames. Each detection uses one core, so more = more detections per second |
+| `--hands 1\|2` | `2` | Hands to track. `1` (drawing alone) roughly halves detection time, so the pen lags less |
 | `--gpu auto\|on\|off` | `auto` | GPU acceleration (MediaPipe GPU works on Linux only) |
 | `--no-restart` | | Don't auto-restart after a crash (for development) |
 

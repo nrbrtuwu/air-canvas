@@ -447,14 +447,16 @@ class CameraStream:
             self.cap.release()
 
 
-def detector_process(conn, model_path: str, use_gpu: bool) -> None:
+def detector_process(conn, model_path: str, use_gpu: bool, num_hands: int = 2) -> None:
     """Child process: runs MediaPipe hand detection. It lives in its own process
     because MediaPipe needs the GIL to hand work between its threads, and sharing
-    the GIL with the display loop made detection several times slower."""
+    the GIL with the display loop made detection several times slower.
+    While fewer than num_hands are tracked, MediaPipe re-runs palm detection on every
+    frame to look for the missing one, so num_hands=1 roughly halves detection time."""
     def create(delegate):
         options = vision.HandLandmarkerOptions(
             base_options=python.BaseOptions(model_asset_path=model_path, delegate=delegate),
-            running_mode=vision.RunningMode.VIDEO, num_hands=2,
+            running_mode=vision.RunningMode.VIDEO, num_hands=num_hands,
             min_hand_detection_confidence=0.60, min_hand_presence_confidence=0.60,
             min_tracking_confidence=0.60,
         )
@@ -506,7 +508,7 @@ class HandTracker:
     has taken, and only results for frames newer than the last shown are kept."""
 
     def __init__(self, cam: CameraStream, model_path: str, acceleration: "Acceleration",
-                 det_size: tuple[int, int], w: int, h: int, detectors: int = 1):
+                 det_size: tuple[int, int], w: int, h: int, detectors: int = 1, num_hands: int = 2):
         self.cam, self.acceleration = cam, acceleration
         self.det_size, self.scale = det_size, np.array([w, h], np.float32)
         self.lock = threading.Lock()
@@ -521,7 +523,7 @@ class HandTracker:
         for _ in range(max(1, detectors)):
             conn, child_conn = mp_process.Pipe()
             process = mp_process.Process(target=detector_process, daemon=True,
-                                         args=(child_conn, model_path, use_gpu))
+                                         args=(child_conn, model_path, use_gpu, num_hands))
             process.start()
             self.workers.append((conn, process))
         for conn, _ in self.workers:      # wait until every model is loaded
@@ -1229,6 +1231,9 @@ def main() -> None:
     ap.add_argument("--detectors", type=int, default=default_detectors(),
                     help="hand detector processes working on alternate frames. More = more "
                          "detections per second on many-core CPUs (default: by core count).")
+    ap.add_argument("--hands", type=int, choices=(1, 2), default=2,
+                    help="hands to track. 1 = one person drawing alone, about twice as fast "
+                         "detection; 2 = two hands / two people.")
     ap.add_argument("--min-cutoff", type=float, default=1.0,
                     help="pen smoothing when the finger is still. Lower = steadier, higher = more responsive.")
     ap.add_argument("--beta", type=float, default=0.025,
@@ -1285,7 +1290,7 @@ def main() -> None:
     bg_img, bg_light = load_background(w, h)
     try:
         with HandTracker(cam, args.model, acceleration, (det_w, det_h), w, h,
-                         args.detectors) as tracker:
+                         args.detectors, args.hands) as tracker:
             frame_seq = det_seq = 0
             hands: list[Hand] = []
             ui_points: list[tuple[int, int]] = []
