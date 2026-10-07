@@ -87,7 +87,7 @@ py -3.13 -m venv .venv
 
 Always start it with `.venv\Scripts\python` (or run `.venv\Scripts\Activate.ps1` first): plain `python` is your system Python, which doesn't have the NPU packages.
 
-#### *I have not tested it on any AMD CPU's that has an NPU, so results may vairy*
+### *I have not tested it on any AMD CPU's that has an NPU, so results may vairy*
 
 ### Snapdragon X (Windows on ARM)
 
