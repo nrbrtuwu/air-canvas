@@ -1,4 +1,5 @@
-"""MediaPipe's hand landmarker pipeline on ONNX Runtime, for the Qualcomm NPU.
+"""MediaPipe's hand landmarker pipeline on ONNX Runtime, for NPUs: Qualcomm
+(Snapdragon, via onnxruntime-qnn) and Intel Core Ultra (via onnxruntime-openvino).
 
 Runs the same two models as MediaPipe (palm detector + hand landmark model, converted
 to ONNX) and reproduces the steps MediaPipe's HandLandmarker graph does around them:
@@ -34,43 +35,89 @@ PALM_WRIST, PALM_MIDDLE = 0, 2
 TRACK_POINTS = [0, 1, 2, 3, 5, 6, 9, 10, 13, 14, 17, 18]
 
 
+BACKENDS = ("qnn-npu", "openvino-npu", "openvino-gpu", "openvino-cpu", "cpu")
+
+
+def _qnn_npu_devices():
+    """Qualcomm NPU devices (Snapdragon), via the onnxruntime-qnn plugin; [] if none."""
+    try:
+        import onnxruntime as ort
+        import onnxruntime_qnn as qnn
+    except ImportError:
+        return []
+    try:
+        ort.register_execution_provider_library("QNNExecutionProvider", qnn.get_library_path())
+    except Exception:  # already registered in this process
+        pass
+    return [d for d in ort.get_ep_devices() if d.ep_name == "QNNExecutionProvider"
+            and d.device.type == ort.OrtHardwareDeviceType.NPU]
+
+
+def openvino_devices() -> list[str]:
+    """OpenVINO devices (e.g. CPU, GPU, NPU on Intel Core Ultra); [] without
+    onnxruntime-openvino + openvino."""
+    try:
+        import onnxruntime as ort
+        if "OpenVINOExecutionProvider" not in ort.get_available_providers():
+            return []
+        if os.name == "nt":  # Windows: the OpenVINO DLLs come from the openvino package
+            import onnxruntime.tools.add_openvino_win_libs as ov_libs
+            ov_libs.add_openvino_libs_to_path()
+        import openvino
+        return list(openvino.Core().available_devices)
+    except Exception:
+        return []
+
+
 def create_session(path: str, device: str = "auto"):
-    """ONNX Runtime session on the NPU (QNN HTP, fp16) or the CPU.
-    Returns (session, description)."""
+    """ONNX Runtime session for one model. device: "auto"/"npu" (Qualcomm NPU, then
+    Intel NPU), one of BACKENDS, or "cpu". Returns (session, description)."""
     import onnxruntime as ort
 
     def options():
         so = ort.SessionOptions()
-        # The models have a symbolic batch dimension; the NPU needs static shapes.
+        # The models have a symbolic batch dimension; NPUs need static shapes.
         for name in ("N", "batch"):
             so.add_free_dimension_override_by_name(name, 1)
         return so
 
-    if device in ("auto", "npu"):
+    tried = []
+    order = {"auto": ("qnn-npu", "openvino-npu"), "npu": ("qnn-npu", "openvino-npu")}.get(device, (device,))
+    for backend in order:
         try:
-            import onnxruntime_qnn as qnn
-            try:
-                ort.register_execution_provider_library("QNNExecutionProvider", qnn.get_library_path())
-            except Exception:  # already registered in this process
-                pass
-            npu = [d for d in ort.get_ep_devices() if d.ep_name == "QNNExecutionProvider"
-                   and d.device.type == ort.OrtHardwareDeviceType.NPU]
-            if not npu:
-                raise RuntimeError("no Qualcomm NPU found")
-            so = options()
-            # Fail instead of quietly running unsupported layers on the CPU.
-            so.add_session_config_entry("session.disable_cpu_ep_fallback", "1")
-            so.add_provider_for_devices(npu, {
-                "backend_path": qnn.get_qnn_htp_path(),
-                "enable_htp_fp16_precision": "1",   # measured: <0.1 px from fp32
-                "htp_performance_mode": "burst",
-            })
-            return ort.InferenceSession(path, so), "NPU"
+            if backend == "qnn-npu":
+                import onnxruntime_qnn as qnn
+                npu = _qnn_npu_devices()
+                if not npu:
+                    raise RuntimeError("no Qualcomm NPU found")
+                so = options()
+                # Fail instead of quietly running unsupported layers on the CPU.
+                so.add_session_config_entry("session.disable_cpu_ep_fallback", "1")
+                so.add_provider_for_devices(npu, {
+                    "backend_path": qnn.get_qnn_htp_path(),
+                    "enable_htp_fp16_precision": "1",   # measured: <0.1 px from fp32
+                    "htp_performance_mode": "burst",
+                })
+                return ort.InferenceSession(path, so), "Qualcomm NPU"
+            if backend.startswith("openvino-"):
+                kind = backend.split("-", 1)[1].upper()
+                if kind not in openvino_devices():
+                    raise RuntimeError(f"OpenVINO has no {kind} device")
+                session = ort.InferenceSession(path, options(), providers=[
+                    ("OpenVINOExecutionProvider", {"device_type": kind})])
+                # If the OpenVINO plugin fails to load (e.g. openvino version does not
+                # match onnxruntime-openvino), ONNX Runtime quietly uses the CPU instead.
+                if session.get_providers()[0] != "OpenVINOExecutionProvider":
+                    raise RuntimeError("OpenVINO plugin failed to load (openvino version mismatch?)")
+                return session, f"Intel {kind} (OpenVINO)"
+            if backend == "cpu":
+                return ort.InferenceSession(path, options(), providers=["CPUExecutionProvider"]), "CPU"
+            raise ValueError(f"unknown backend {backend!r}")
         except Exception as error:
-            if device == "npu":
-                raise RuntimeError(f"NPU unavailable: {error}") from error
-    so = options()
-    return ort.InferenceSession(path, so, providers=["CPUExecutionProvider"]), "CPU"
+            tried.append(f"{backend}: {error}")
+    if device in ("auto",):
+        return ort.InferenceSession(path, options(), providers=["CPUExecutionProvider"]), "CPU"
+    raise RuntimeError("no usable backend (" + "; ".join(tried) + ")")
 
 
 def ssd_anchors() -> np.ndarray:
@@ -267,22 +314,13 @@ class NpuHandLandmarker:
         return hands
 
 
-def available() -> bool:
-    """True if onnxruntime-qnn, the ONNX models and a Qualcomm NPU are all present
-    (cheap: no model is loaded)."""
+def available(intel: bool = False) -> bool:
+    """True if the ONNX models and a supported NPU are present (cheap: no model is
+    loaded). Qualcomm NPUs count by default; Intel NPUs only with intel=True,
+    because a fast desktop CPU may beat them (see scripts/bench_hands.py)."""
     if not all(os.path.isfile(p) for p in default_models()):
         return False
-    try:
-        import onnxruntime as ort
-        import onnxruntime_qnn as qnn
-        try:
-            ort.register_execution_provider_library("QNNExecutionProvider", qnn.get_library_path())
-        except Exception:  # already registered in this process
-            pass
-        return any(d.ep_name == "QNNExecutionProvider" and d.device.type == ort.OrtHardwareDeviceType.NPU
-                   for d in ort.get_ep_devices())
-    except Exception:
-        return False
+    return bool(_qnn_npu_devices()) or (intel and "NPU" in openvino_devices())
 
 
 def default_models(here: Optional[str] = None) -> tuple[str, str]:

@@ -1,0 +1,7 @@
+# Optional, x64 Windows with an Intel Core Ultra NPU (experimental): runs hand detection
+# through OpenVINO with --engine npu. Install on top of requirements.txt.
+# onnxruntime-openvino is built against one exact OpenVINO release; with any other
+# version its plugin fails to load (npu_hands.py reports that instead of silently
+# falling back to the CPU). Don't also install plain "onnxruntime" in the same venv.
+onnxruntime-openvino==1.24.1
+openvino==2025.4.1
