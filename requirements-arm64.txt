@@ -1,0 +1,13 @@
+# Windows on ARM (native ARM64 Python). OpenCV is built by scripts\build-opencv-arm64.ps1,
+# and mediapipe is installed with --no-deps because it would pull in opencv-contrib-python,
+# which has no ARM64 Windows wheel. These are mediapipe's other dependencies.
+# cv2_enumerate_cameras has no ARM64 wheel either; its generic one can't read Windows
+# camera names, so it is compiled from source (uses the same Build Tools as OpenCV).
+--no-binary cv2_enumerate_cameras
+numpy
+cv2_enumerate_cameras
+absl-py~=2.3
+certifi
+sounddevice~=0.5
+flatbuffers~=25.9
+matplotlib

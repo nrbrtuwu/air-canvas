@@ -54,6 +54,20 @@ By default the app restarts itself after a crash and writes the error to `crash.
 - If the window doesn't open (Wayland): `QT_QPA_PLATFORM=xcb python camera.py`
 - `sudo apt install python3-tk` lets the UI detect your screen size (otherwise it assumes 1080p).
 
+## Windows on ARM (beta)
+
+Runs natively on ARM64 Python (e.g. Snapdragon X laptops) instead of x64 emulation. MediaPipe ships an ARM64 wheel, but OpenCV doesn't, so it is compiled once (15-30 min). Needs git, an ARM64 Python 3.12 from python.org, and Visual Studio 2022 Build Tools with **Desktop development with C++**, **MSVC ARM64 build tools** and a **Windows 11 SDK**.
+
+```powershell
+py -3.12-arm64 -m venv .venv-arm64
+.\scripts\build-opencv-arm64.ps1
+.venv-arm64\Scripts\pip install -r requirements-arm64.txt
+.venv-arm64\Scripts\pip install mediapipe --no-deps
+.venv-arm64\Scripts\python camera.py
+```
+
+pip warns that mediapipe needs `opencv-contrib-python`. That's expected: the OpenCV built by the script replaces it.
+
 
 ## Disclaimer
 
