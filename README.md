@@ -87,6 +87,8 @@ py -3.13 -m venv .venv
 
 Always start it with `.venv\Scripts\python` (or run `.venv\Scripts\Activate.ps1` first): plain `python` is your system Python, which doesn't have the NPU packages.
 
+#### *I have not tested it on any AMD CPU's that has an NPU, so results may vairy*
+
 ### Snapdragon X (Windows on ARM)
 
 This runs natively on ARM64 Python instead of x64 emulation. MediaPipe ships an ARM64 wheel, but OpenCV doesn't, so it is compiled once (15-30 min). Needs git, an **ARM64 Python 3.12** from python.org, and Visual Studio 2022 Build Tools with **Desktop development with C++**, **MSVC ARM64 build tools** and a **Windows 11 SDK**.
