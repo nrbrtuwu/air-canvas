@@ -490,51 +490,76 @@ def detector_process(conn, model_path: str, use_gpu: bool) -> None:
             ]))
 
 
+def default_detectors() -> int:
+    """MediaPipe's Python CPU path runs one detection on a single core, so several
+    detector processes working on alternate frames multiply detections per second
+    (measured: near-linear up to 4 on a 12-core Snapdragon X). Leave cores for the
+    camera and display threads."""
+    cores = os.cpu_count() or 1
+    return 3 if cores >= 8 else 2 if cores >= 4 else 1
+
+
 class HandTracker:
-    """Feeds the newest camera frame to the detector process from a background
-    thread, so the display loop never waits for detection (the slowest step)."""
+    """Feeds the newest camera frames to detector processes from background
+    threads, so the display loop never waits for detection (the slowest step).
+    Each detector has its own thread; a thread claims a frame no other detector
+    has taken, and only results for frames newer than the last shown are kept."""
 
     def __init__(self, cam: CameraStream, model_path: str, acceleration: "Acceleration",
-                 det_size: tuple[int, int], w: int, h: int):
+                 det_size: tuple[int, int], w: int, h: int, detectors: int = 1):
         self.cam, self.acceleration = cam, acceleration
         self.det_size, self.scale = det_size, np.array([w, h], np.float32)
         self.lock = threading.Lock()
         self.hands: list[Hand] = []
         self.infer_ms = 0.0
         self.seq = 0                      # bumps once per finished detection
+        self.claimed = 0                  # newest camera frame handed to a detector
+        self.shown = 0                    # camera frame of the published hands
         self.error: Optional[BaseException] = None
-        self.conn, child_conn = mp_process.Pipe()
         use_gpu = acceleration.media_pipe_delegate == python.BaseOptions.Delegate.GPU
-        self.process = mp_process.Process(target=detector_process, daemon=True,
-                                          args=(child_conn, model_path, use_gpu))
-        self.process.start()
-        kind, detail = self.conn.recv()   # wait until the model is loaded
-        if kind == "error":
-            raise RuntimeError(f"Hand detector failed to start: {detail}")
-        print(f"MediaPipe: {detail}")
+        self.workers: list[tuple] = []
+        for _ in range(max(1, detectors)):
+            conn, child_conn = mp_process.Pipe()
+            process = mp_process.Process(target=detector_process, daemon=True,
+                                         args=(child_conn, model_path, use_gpu))
+            process.start()
+            self.workers.append((conn, process))
+        for conn, _ in self.workers:      # wait until every model is loaded
+            kind, detail = conn.recv()
+            if kind == "error":
+                self.stop_processes()
+                raise RuntimeError(f"Hand detector failed to start: {detail}")
+        print(f"MediaPipe: {detail}, {len(self.workers)} detector process(es)")
         self.running = True
-        self.thread = threading.Thread(target=self._run, daemon=True)
-        self.thread.start()
+        self.threads = [threading.Thread(target=self._run, args=(conn,), daemon=True)
+                        for conn, _ in self.workers]
+        for thread in self.threads:
+            thread.start()
 
-    def _run(self) -> None:
-        frame_seq, timestamp_ms = 0, 0
+    def _run(self, conn) -> None:
+        timestamp_ms = 0
         try:
             while self.running:
-                frame_seq, frame = self.cam.read(frame_seq)
+                frame_seq, frame = self.cam.read(self.claimed)
                 if frame is None:
                     continue
+                with self.lock:
+                    if frame_seq <= self.claimed:   # another detector took it
+                        continue
+                    self.claimed = frame_seq
                 t0 = time.perf_counter()
                 rgb = self.acceleration.prepare(frame, self.det_size)
                 timestamp_ms = max(timestamp_ms + 1, int(time.monotonic() * 1000))
-                self.conn.send((timestamp_ms, rgb))
-                _, found = self.conn.recv()
+                conn.send((timestamp_ms, rgb))
+                _, found = conn.recv()
                 hands = []
                 for label, norm in found:
                     pts = norm * self.scale
                     hands.append(Hand(label, pts, is_fist(pts)))  # fist computed once
                 with self.lock:
-                    self.hands, self.seq = hands, self.seq + 1
-                    self.infer_ms = (time.perf_counter() - t0) * 1000.0
+                    if frame_seq > self.shown:      # a later frame may finish first
+                        self.hands, self.seq, self.shown = hands, self.seq + 1, frame_seq
+                        self.infer_ms = (time.perf_counter() - t0) * 1000.0
         except BaseException as error:  # surfaced in the main loop
             self.error = error
 
@@ -544,14 +569,20 @@ class HandTracker:
 
     def stop(self) -> None:
         self.running = False
-        self.thread.join(timeout=2.0)
-        try:
-            self.conn.send(None)
-        except OSError:
-            pass
-        self.process.join(timeout=2.0)
-        if self.process.is_alive():
-            self.process.terminate()
+        for thread in self.threads:
+            thread.join(timeout=2.0)
+        self.stop_processes()
+
+    def stop_processes(self) -> None:
+        for conn, _ in self.workers:
+            try:
+                conn.send(None)
+            except OSError:
+                pass
+        for _, process in self.workers:
+            process.join(timeout=2.0)
+            if process.is_alive():
+                process.terminate()
 
     def __enter__(self) -> "HandTracker":
         return self
@@ -1195,6 +1226,9 @@ def main() -> None:
     ap.add_argument("--height", type=int, default=1080, help="preview / canvas height")
     ap.add_argument("--detect-width", type=int, default=400,
                     help="width of the image given to the hand detector (0 = full size). Lower = faster.")
+    ap.add_argument("--detectors", type=int, default=default_detectors(),
+                    help="hand detector processes working on alternate frames. More = more "
+                         "detections per second on many-core CPUs (default: by core count).")
     ap.add_argument("--min-cutoff", type=float, default=1.0,
                     help="pen smoothing when the finger is still. Lower = steadier, higher = more responsive.")
     ap.add_argument("--beta", type=float, default=0.025,
@@ -1250,7 +1284,8 @@ def main() -> None:
     # Page shown instead of the camera when the switch is on (background.png or beige).
     bg_img, bg_light = load_background(w, h)
     try:
-        with HandTracker(cam, args.model, acceleration, (det_w, det_h), w, h) as tracker:
+        with HandTracker(cam, args.model, acceleration, (det_w, det_h), w, h,
+                         args.detectors) as tracker:
             frame_seq = det_seq = 0
             hands: list[Hand] = []
             ui_points: list[tuple[int, int]] = []
