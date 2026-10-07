@@ -326,8 +326,19 @@ def open_camera(index: int, w: int, h: int) -> Optional[cv2.VideoCapture]:
     return cap
 
 
-def find_cameras(max_index: int = 6) -> list[tuple[int, int, int]]:
-    """(index, width, height) of every camera that delivers a frame, by probing indices."""
+def find_cameras() -> list[tuple[int, str]]:
+    """(index, device name) of every camera. The index already selects the backend the
+    names came from (e.g. 700 = DirectShow camera 0), so it can go straight to VideoCapture."""
+    try:
+        from cv2_enumerate_cameras import enumerate_cameras
+    except ImportError:
+        return [(index, f"Camera {index}") for index in probe_cameras()]
+    backend = {"win32": cv2.CAP_DSHOW, "linux": cv2.CAP_V4L2}.get(sys.platform, cv2.CAP_ANY)
+    return [(c.backend + c.index, c.name) for c in enumerate_cameras(backend)]
+
+
+def probe_cameras(max_index: int = 6) -> list[int]:
+    """Indices that deliver a frame; fallback when cv2_enumerate_cameras is missing."""
     try:
         previous = cv2.utils.logging.getLogLevel()
         cv2.utils.logging.setLogLevel(cv2.utils.logging.LOG_LEVEL_SILENT)  # missing indices warn
@@ -338,9 +349,9 @@ def find_cameras(max_index: int = 6) -> list[tuple[int, int, int]]:
         for index in range(max_index):
             cap = cv2.VideoCapture(index)
             if cap.isOpened():
-                ok, frame = cap.read()
+                ok, _ = cap.read()
                 if ok:
-                    found.append((index, frame.shape[1], frame.shape[0]))
+                    found.append(index)
             cap.release()
     finally:
         if previous is not None:
@@ -349,29 +360,26 @@ def find_cameras(max_index: int = 6) -> list[tuple[int, int, int]]:
 
 
 def ask_camera() -> Optional[int]:
-    """Ask in the terminal which camera to use; None if there is nothing to choose."""
+    """Ask in the terminal which camera to use; None if no camera was found."""
     print("Looking for cameras...")
     cameras = find_cameras()
     if not cameras:
         print("No camera found.")
         return None
-    if len(cameras) == 1:
-        index, cw, ch = cameras[0]
-        print(f"Using camera {index} ({cw}x{ch}), the only one found.")
-        return index
-    for index, cw, ch in cameras:
-        print(f"  [{index}] Camera {index} ({cw}x{ch})")
-    indices = [index for index, _, _ in cameras]
+    for number, (_, name) in enumerate(cameras, 1):
+        print(f"  [{number}] {name}")
     while True:
         try:
-            answer = input(f"Which camera do you want to use? [{indices[0]}]: ").strip()
+            answer = input("Which camera do you want to use? [1]: ").strip()
         except EOFError:
-            return indices[0]
+            answer = ""
         if not answer:
-            return indices[0]
-        if answer.isdigit() and int(answer) in indices:
-            return int(answer)
-        print(f"Please enter one of: {', '.join(map(str, indices))}")
+            answer = "1"
+        if answer.isdigit() and 1 <= int(answer) <= len(cameras):
+            index, name = cameras[int(answer) - 1]
+            print(f"Using {name}.")
+            return index
+        print(f"Please enter a number from 1 to {len(cameras)}.")
 
 
 class CameraStream:

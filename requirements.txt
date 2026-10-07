@@ -1,3 +1,4 @@
 opencv-python
 mediapipe
 numpy
+cv2_enumerate_cameras
