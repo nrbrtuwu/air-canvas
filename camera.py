@@ -1277,9 +1277,15 @@ def main() -> None:
     if not os.path.isfile(args.model):
         raise FileNotFoundError(f"Hand model not found: {args.model}")
     engine = args.engine
+    import npu_hands
     if engine == "auto":
-        import npu_hands
         engine = "npu" if npu_hands.available() else "mediapipe"
+    elif engine == "npu" and not npu_hands.available(intel=True):
+        print("--engine npu needs a supported NPU and its packages in this Python:\n"
+              "  Snapdragon: pip install -r requirements-arm64.txt\n"
+              "  Intel Core Ultra: pip install -r requirements-intel-npu.txt\n"
+              f"(running {sys.executable}; if you made a venv, start the app with its python)")
+        sys.exit(EXIT_SETUP_ERROR)
     if args.detectors is None:
         # One NPU detector keeps up with 60 fps; more would only queue on the NPU.
         args.detectors = 1 if engine == "npu" else default_detectors()
@@ -1301,7 +1307,7 @@ def main() -> None:
         # Restarting would not help, so tell the supervisor to stop (see supervise()).
         print(f"Cannot open camera {args.camera}. If it is a virtual camera (e.g. OBS), "
               f"start it first; otherwise check that no other app is using it.")
-        sys.exit(EXIT_NO_CAMERA)
+        sys.exit(EXIT_SETUP_ERROR)
     cam_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     cam_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     w, h = args.width, args.height
@@ -1471,7 +1477,7 @@ def main() -> None:
 
 
 CRASH_LOG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "crash.log")
-EXIT_NO_CAMERA = 3   # the chosen camera cannot be opened: not a crash, don't restart
+EXIT_SETUP_ERROR = 3   # e.g. camera cannot be opened, engine not installed: not a crash, don't restart
 
 
 def log_crash(text: str) -> None:
@@ -1509,7 +1515,7 @@ def supervise() -> None:
             code = subprocess.call(command)
         except KeyboardInterrupt:
             return
-        if code in (0, EXIT_NO_CAMERA):
+        if code in (0, EXIT_SETUP_ERROR):
             return
         now = time.monotonic()
         crashes = [t for t in crashes if now - t < 60] + [now]
