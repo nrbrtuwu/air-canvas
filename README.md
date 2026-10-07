@@ -42,7 +42,7 @@ Put `background.png` (or `.jpg` / `.jpeg`) next to `camera.py` and restart. It r
 
 | Option | Default | |
 |---|---|---|
-| `--camera N` | `0` | Which camera to use |
+| `--camera N` | asked at start | Which camera to use. Without it, the app lists the cameras it finds and asks in the terminal |
 | `--width`, `--height` | `1920`, `1080` | Preview / canvas size (try `1280 720` on slow machines) |
 | `--gpu auto\|on\|off` | `auto` | GPU acceleration (MediaPipe GPU works on Linux only) |
 | `--no-restart` | | Don't auto-restart after a crash (for development) |

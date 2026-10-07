@@ -326,6 +326,54 @@ def open_camera(index: int, w: int, h: int) -> Optional[cv2.VideoCapture]:
     return cap
 
 
+def find_cameras(max_index: int = 6) -> list[tuple[int, int, int]]:
+    """(index, width, height) of every camera that delivers a frame, by probing indices."""
+    try:
+        previous = cv2.utils.logging.getLogLevel()
+        cv2.utils.logging.setLogLevel(cv2.utils.logging.LOG_LEVEL_SILENT)  # missing indices warn
+    except AttributeError:
+        previous = None
+    found = []
+    try:
+        for index in range(max_index):
+            cap = cv2.VideoCapture(index)
+            if cap.isOpened():
+                ok, frame = cap.read()
+                if ok:
+                    found.append((index, frame.shape[1], frame.shape[0]))
+            cap.release()
+    finally:
+        if previous is not None:
+            cv2.utils.logging.setLogLevel(previous)
+    return found
+
+
+def ask_camera() -> Optional[int]:
+    """Ask in the terminal which camera to use; None if there is nothing to choose."""
+    print("Looking for cameras...")
+    cameras = find_cameras()
+    if not cameras:
+        print("No camera found.")
+        return None
+    if len(cameras) == 1:
+        index, cw, ch = cameras[0]
+        print(f"Using camera {index} ({cw}x{ch}), the only one found.")
+        return index
+    for index, cw, ch in cameras:
+        print(f"  [{index}] Camera {index} ({cw}x{ch})")
+    indices = [index for index, _, _ in cameras]
+    while True:
+        try:
+            answer = input(f"Which camera do you want to use? [{indices[0]}]: ").strip()
+        except EOFError:
+            return indices[0]
+        if not answer:
+            return indices[0]
+        if answer.isdigit() and int(answer) in indices:
+            return int(answer)
+        print(f"Please enter one of: {', '.join(map(str, indices))}")
+
+
 class CameraStream:
     """Grabs frames in a background thread so the main loop never blocks on I/O.
     Frames are resized to the preview size and mirrored here, off the main thread.
@@ -1378,6 +1426,15 @@ def supervise() -> None:
 if __name__ == "__main__":
     # Default: supervised (auto-restart). --worker is the supervised child;
     # --no-restart runs the app directly, e.g. while developing.
+    # The camera is asked for once here (not in the worker), so restarts reuse the choice.
+    if ("--worker" not in sys.argv and sys.stdin.isatty()
+            and not any(a == "--camera" or a.startswith("--camera=") for a in sys.argv)):
+        try:
+            chosen = ask_camera()
+        except KeyboardInterrupt:
+            sys.exit(0)
+        if chosen is not None:
+            sys.argv += ["--camera", str(chosen)]
     if "--worker" in sys.argv:
         sys.argv.remove("--worker")
         run_app()
