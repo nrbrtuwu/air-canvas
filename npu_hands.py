@@ -314,10 +314,9 @@ class NpuHandLandmarker:
         return hands
 
 
-def available(intel: bool = False) -> bool:
+def available(intel: bool = True) -> bool:
     """True if the ONNX models and a supported NPU are present (cheap: no model is
-    loaded). Qualcomm NPUs count by default; Intel NPUs only with intel=True,
-    because a fast desktop CPU may beat them (see scripts/bench_hands.py)."""
+    loaded). intel=False only counts Qualcomm NPUs."""
     if not all(os.path.isfile(p) for p in default_models()):
         return False
     return bool(_qnn_npu_devices()) or (intel and "NPU" in openvino_devices())

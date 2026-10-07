@@ -463,7 +463,19 @@ def detector_process(conn, model_path: str, use_gpu: bool, num_hands: int = 2,
     the GIL with the display loop made detection several times slower.
     While fewer than num_hands are tracked, MediaPipe re-runs palm detection on every
     frame to look for the missing one, so num_hands=1 roughly halves detection time.
-    engine "npu" runs the same models through npu_hands on a Qualcomm NPU instead."""
+    engine "npu" runs the same models through npu_hands on an NPU instead."""
+    import signal
+    # Ctrl+C reaches every process; the main app stops the detectors itself, so
+    # don't print a KeyboardInterrupt traceback from each of them.
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    if not os.environ.get("KAMERA_VERBOSE"):
+        # MediaPipe / TFLite / ONNX Runtime log from native code straight to file
+        # descriptor 2. Point that at nul, but keep Python's own errors visible.
+        python_stderr = os.dup(2)
+        devnull = os.open(os.devnull, os.O_WRONLY)
+        os.dup2(devnull, 2)
+        os.close(devnull)
+        sys.stderr = os.fdopen(python_stderr, "w", buffering=1)
     if engine == "npu":
         try:
             import npu_hands
@@ -1279,7 +1291,9 @@ def main() -> None:
     engine = args.engine
     import npu_hands
     if engine == "auto":
-        engine = "npu" if npu_hands.available() else "mediapipe"
+        # Measured: Snapdragon X NPU ~5 ms, Intel Core Ultra 245KF NPU ~8-10 ms per
+        # detection in the app, against ~25 ms with MediaPipe on the CPU.
+        engine = "npu" if npu_hands.available(intel=True) else "mediapipe"
     elif engine == "npu" and not npu_hands.available(intel=True):
         print("--engine npu needs a supported NPU and its packages in this Python:\n"
               "  Snapdragon: pip install -r requirements-arm64.txt\n"
