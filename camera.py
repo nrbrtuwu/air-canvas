@@ -331,10 +331,16 @@ def find_cameras() -> list[tuple[int, str]]:
     names came from (e.g. 700 = DirectShow camera 0), so it can go straight to VideoCapture."""
     try:
         from cv2_enumerate_cameras import enumerate_cameras
+        backend = {"win32": cv2.CAP_DSHOW, "linux": cv2.CAP_V4L2}.get(sys.platform, cv2.CAP_ANY)
+        cameras = [(c.backend + c.index, c.name) for c in enumerate_cameras(backend)]
+        if cameras:
+            return cameras
+        print("Could not read camera names on this system, showing numbers instead.")
     except ImportError:
-        return [(index, f"Camera {index}") for index in probe_cameras()]
-    backend = {"win32": cv2.CAP_DSHOW, "linux": cv2.CAP_V4L2}.get(sys.platform, cv2.CAP_ANY)
-    return [(c.backend + c.index, c.name) for c in enumerate_cameras(backend)]
+        print("Camera names need the cv2_enumerate_cameras package: pip install -r requirements.txt")
+    except Exception as e:
+        print(f"Could not read camera names ({e}), showing numbers instead.")
+    return [(index, f"Camera {index}") for index in probe_cameras()]
 
 
 def probe_cameras(max_index: int = 6) -> list[int]:
