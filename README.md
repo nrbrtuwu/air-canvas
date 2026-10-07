@@ -82,10 +82,10 @@ Needs **Python 3.11-3.13** (the Intel package doesn't support 3.14 yet; `py inst
 ```powershell
 py -3.13 -m venv .venv
 .venv\Scripts\pip install -r requirements.txt -r requirements-intel-npu.txt
-.venv\Scripts\python camera.py
+python camera.py
 ```
 
-Always start it with `.venv\Scripts\python` (or run `.venv\Scripts\Activate.ps1` first): plain `python` is your system Python, which doesn't have the NPU packages.
+`camera.py` switches to the `.venv` next to it by itself (on ARM64 it prefers `.venv-arm64`), so plain `python camera.py` uses the venv's Python and its NPU packages. Set `KAMERA_NO_VENV=1` to turn that off.
 
 ## *I have not tested it on any AMD CPU's that has an NPU, so results may vairy*
 
@@ -98,7 +98,7 @@ py -3.12-arm64 -m venv .venv-arm64
 .\scripts\build-opencv-arm64.ps1
 .venv-arm64\Scripts\pip install -r requirements-arm64.txt
 .venv-arm64\Scripts\pip install mediapipe --no-deps
-.venv-arm64\Scripts\python camera.py
+python camera.py
 ```
 
 pip warns that mediapipe needs `opencv-contrib-python`. That's expected: the OpenCV built by the script replaces it. The NPU part (`onnxruntime-qnn`) is included in `requirements-arm64.txt`.

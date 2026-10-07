@@ -17,6 +17,34 @@ import threading
 import time
 from typing import Optional
 
+
+def use_project_venv() -> None:
+    """If a venv sits next to this file and we were started with another Python
+    (e.g. plain `python camera.py`), rerun with the venv's Python, so its packages
+    (NPU engine, ARM64 OpenCV) are always used. Runs before the heavy imports,
+    which the other Python may not even have. KAMERA_NO_VENV=1 turns it off."""
+    if os.environ.get("KAMERA_NO_VENV"):
+        return
+    import platform
+    import subprocess
+    here = os.path.dirname(os.path.abspath(__file__))
+    names = [".venv-arm64", ".venv"] if platform.machine().upper() in ("ARM64", "AARCH64") else [".venv"]
+    for name in names:
+        venv = os.path.join(here, name)
+        exe = os.path.join(venv, "Scripts", "python.exe") if os.name == "nt" else os.path.join(venv, "bin", "python")
+        if not os.path.isfile(exe):
+            continue
+        if os.path.normcase(os.path.abspath(sys.prefix)) == os.path.normcase(venv):
+            return   # already running in it
+        try:
+            sys.exit(subprocess.call([exe, os.path.abspath(__file__), *sys.argv[1:]]))
+        except KeyboardInterrupt:   # Ctrl+C: the app in the venv handles it
+            sys.exit(0)
+
+
+if __name__ == "__main__":
+    use_project_venv()
+
 # Quiet MediaPipe / TFLite startup warnings. Must be set before mediapipe is imported.
 if not os.environ.get("KAMERA_VERBOSE"):
     os.environ.setdefault("GLOG_minloglevel", "2")
